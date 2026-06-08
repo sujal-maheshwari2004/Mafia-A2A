@@ -293,7 +293,11 @@ class LLMAgent(Agent):
     # Discussion
     # ------------------------------------------------------------------
     def discussion_turn(self, view: AgentView) -> CommRequest | None:
-        others = list(view.others_alive)
+        # Who can actually hear you -- at night that's only your fellow Mafia (or
+        # no one, for the Doctor/Detective acting alone), never the sleeping table.
+        # Naming a sleeping player as a recipient is a protocol violation the bus
+        # rejects outright, so the candidate pool must mirror presence, not life.
+        others = [n for n in view.present if n != view.self_name]
         if not others:
             return None
 
