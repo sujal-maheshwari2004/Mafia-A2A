@@ -297,11 +297,22 @@ class LLMAgent(Agent):
         if not others:
             return None
 
-        question = (
-            "It's your moment to optionally speak. Decide whether to say something right now, and "
-            "if so, choose your channel and audience deliberately -- broadcasting, huddling, and "
-            "whispering each send a different signal to the room. If you'd rather wait and listen, pass."
-        )
+        if view.phase is Phase.NIGHT:
+            question = (
+                "This is your private huddle with your fellow Mafia, before each of you separately "
+                "names tonight's target -- no one else at the table can hear a word of it, however "
+                "you choose to phrase it. This is your one chance all night to actually talk: settle "
+                "on who you're taking out and why, trade reads on who's getting close to the truth, "
+                "line up your cover story for the morning, or warn each other what to watch for. "
+                "Passing here means walking in tomorrow with no plan and no story straight -- decide "
+                "whether that's really the move, and if you do speak, choose your channel on purpose."
+            )
+        else:
+            question = (
+                "It's your moment to optionally speak. Decide whether to say something right now, and "
+                "if so, choose your channel and audience deliberately -- broadcasting, huddling, and "
+                "whispering each send a different signal to the room. If you'd rather wait and listen, pass."
+            )
         try:
             decision = self._discussion_brain.invoke(self._messages(view, question))
         except Exception as exc:
