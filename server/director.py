@@ -24,8 +24,8 @@ from .hub import GameHub
 
 logger = logging.getLogger("mafia.director")
 
-# Boundaries are picked on the half-hour in IST (the table's home timezone),
-# so the schedule reads as a clean run of x:30s.
+# Boundaries are picked at quarter-to in IST (the table's home timezone),
+# so the schedule reads as a clean run of x:45s.
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 # The fixed table everyone tunes in to see -- no viewer ever configures this.
@@ -53,9 +53,9 @@ class _RolesRevealed:
 
 
 def _next_hour_boundary(now: datetime | None = None) -> datetime:
-    """Next X:30 mark in IST -- the table's regular curtain time."""
+    """Next X:45 mark in IST -- the table's regular curtain time."""
     now = (now or datetime.now(timezone.utc)).astimezone(_IST)
-    boundary = now.replace(minute=30, second=0, microsecond=0)
+    boundary = now.replace(minute=45, second=0, microsecond=0)
     if boundary <= now:
         boundary += timedelta(hours=1)
     return boundary.astimezone(timezone.utc)
