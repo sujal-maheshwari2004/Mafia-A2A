@@ -24,6 +24,10 @@ from .hub import GameHub
 
 logger = logging.getLogger("mafia.director")
 
+# Boundaries are picked on the hour in IST (the table's home timezone) -- UTC
+# hour boundaries land on the half-hour there, which read as a string of x:30s.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
 # The fixed table everyone tunes in to see -- no viewer ever configures this.
 PLAYER_NAMES = [
     "Avery", "Bailey", "Casey", "Drew", "Ellis",
@@ -49,8 +53,9 @@ class _RolesRevealed:
 
 
 def _next_hour_boundary(now: datetime | None = None) -> datetime:
-    now = now or datetime.now(timezone.utc)
-    return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    now = (now or datetime.now(timezone.utc)).astimezone(_IST)
+    boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return boundary.astimezone(timezone.utc)
 
 
 def _build_agents(seed: int) -> list[Agent]:
