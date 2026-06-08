@@ -111,6 +111,13 @@ SCHEME -- don't just stand in the middle of the room saying everything to everyo
 That is not how people who need allies, cover, or an alibi actually operate:
   - Pull someone aside BEFORE you commit to a position out loud, to test a read,
     trade notes, or get a feel for whether they'd back you if you spoke up.
+  - Read the room before you pick who to pull aside: you can always see the SHAPE
+    of a private exchange even when you can't hear it (who leaned toward whom,
+    how many). If the person you want is already deep in a side conversation with
+    someone else, don't go start a competing huddle with them right this second --
+    that's the kind of double-booking a sharp player at the table would notice.
+    Wait for them to surface, fold yourself into the existing knot if it makes
+    sense, or spend this moment on someone who's actually free to talk.
   - Build a quiet alliance with one or two people you've started to trust, and
     actually lean on it later -- back each other's votes, cross-confirm a story,
     warn each other privately when the room turns.
@@ -302,14 +309,17 @@ class LLMAgent(Agent):
             return None
 
         if view.phase is Phase.NIGHT:
+            killable = [n for n in view.others_alive if n not in view.teammates]
             question = (
                 "This is your private huddle with your fellow Mafia, before each of you separately "
                 "names tonight's target -- no one else at the table can hear a word of it, however "
                 "you choose to phrase it. This is your one chance all night to actually talk: settle "
-                "on who you're taking out and why, trade reads on who's getting close to the truth, "
-                "line up your cover story for the morning, or warn each other what to watch for. "
-                "Passing here means walking in tomorrow with no plan and no story straight -- decide "
-                "whether that's really the move, and if you do speak, choose your channel on purpose."
+                f"on who you're taking out and why -- the only people left to take out are "
+                f"{', '.join(killable)}, so don't waste the huddle floating a name that's already an "
+                "empty chair -- trade reads on who's getting close to the truth, line up your cover "
+                "story for the morning, or warn each other what to watch for. Passing here means "
+                "walking in tomorrow with no plan and no story straight -- decide whether that's "
+                "really the move, and if you do speak, choose your channel on purpose."
             )
         else:
             question = (
@@ -431,6 +441,13 @@ class LLMAgent(Agent):
             known = ", ".join(f"{name} is {faction.value}" for name, faction in view.known_factions.items())
             lines.append(f"What you privately know, and only you know: {known}.")
 
+        huddles = self._active_huddles(view)
+        if huddles:
+            lines.append("")
+            lines.append("Side conversations you can see are underway RIGHT NOW -- you may not catch")
+            lines.append("the words, but no one slips off with someone else unnoticed at this table:")
+            lines.extend(f"  - {' and '.join(group)} are off in their own exchange" for group in huddles)
+
         if self._memory:
             lines.append("")
             lines.append(
@@ -448,6 +465,34 @@ class LLMAgent(Agent):
 
         lines += ["", question]
         return "\n".join(lines)
+
+    def _active_huddles(self, view: AgentView) -> list[tuple[str, ...]]:
+        """Side conversations visibly underway right now, as the room would see them.
+
+        A bystander can't hear a private exchange, but they can always see its
+        SHAPE -- who leaned in with whom, just now, in this same phase. Walking
+        the feed newest-first and "claiming" each name into the first (i.e. most
+        recent) group it appears in gives a clean snapshot of where everyone last
+        stepped away to -- exactly what you'd want to know before pulling someone
+        aside who may already be mid-huddle with someone else.
+        """
+        claimed: set[str] = set()
+        huddles: list[tuple[str, ...]] = []
+        for sighting in reversed(view.feed):
+            participants = {sighting.sender, *sighting.to}
+            if (
+                sighting.cast is CastType.BROADCAST
+                or view.self_name in participants
+                or sighting.day_number != view.day_number
+                or sighting.phase_label != view.phase.value
+            ):
+                continue
+            group = tuple(sorted(participants))
+            if len(group) < 2 or claimed & set(group):
+                continue
+            claimed.update(group)
+            huddles.append(group)
+        return huddles
 
     def _remember(self, view: AgentView, note: str) -> None:
         """File this turn's private reasoning away as a note-to-self for later turns.
