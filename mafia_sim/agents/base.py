@@ -16,6 +16,21 @@ from ..models import Faction, Phase, Role
 
 
 @dataclass(frozen=True)
+class DeathRecord:
+    """One player's exit from the table, exactly as the room would have witnessed it.
+
+    Everyone still seated *knows* who's gone -- an empty chair is impossible to
+    miss. What they know about *why* differs by how it happened: a lynching is
+    a public verdict that unmasks the victim's role on the spot, while a night
+    kill leaves only a body and a mystery (`revealed_role` is `None`).
+    """
+    name: str
+    day_number: int
+    cause: str                    # e.g. "killed in the night" or "lynched by the town's vote"
+    revealed_role: str | None     # the role made public at the moment of death, if any
+
+
+@dataclass(frozen=True)
 class AgentView:
     self_name: str
     role: Role
@@ -23,6 +38,7 @@ class AgentView:
     day_number: int
     phase: Phase
     alive: tuple[str, ...]
+    dead: tuple[DeathRecord, ...]           # gone from the table, in the order they fell
     teammates: tuple[str, ...]              # fellow mafia, if you are one
     known_factions: dict[str, Faction]      # learned via investigation, etc.
     feed: tuple[Sighting, ...]              # your personal A2A perception history

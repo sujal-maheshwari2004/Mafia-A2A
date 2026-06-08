@@ -72,6 +72,23 @@ def root() -> dict[str, str]:
     }
 
 
+@app.get("/game/roles")
+def roles() -> dict[str, dict[str, str] | None]:
+    """Reveal who is who at the table currently (or most recently) seated.
+
+    The WebSocket stream only ever reveals a seat's role when the *table itself*
+    learns it -- a lynch unmasks the victim, the final `game_ended` unmasks
+    everyone. This endpoint is the deliberate exception: an out-of-band peek
+    behind the curtain, available from the moment a table sits down, for a
+    spectator UI that wants to offer one (a "reveal seats" toggle, a who's-who
+    legend, face-down cards a viewer can choose to flip, ...).
+
+    Returns `{"roles": {"Avery": "Mafia", ...}}`, or `{"roles": null}` before
+    the very first table has ever been seated.
+    """
+    return {"roles": hub.roles}
+
+
 @app.websocket("/ws/game")
 async def stream_game(websocket: WebSocket) -> None:
     """Tune in to the one shared game, frame by frame, the moment you connect.

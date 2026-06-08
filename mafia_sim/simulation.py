@@ -22,9 +22,10 @@ a pass where nobody speaks ends the conversation.
 from __future__ import annotations
 
 import random
+from collections import Counter
 from collections.abc import Iterator
 
-from .agents import Agent, AgentView
+from .agents import Agent, AgentView, DeathRecord
 from .events import (
     DayResolved,
     GameEnded,
@@ -33,6 +34,7 @@ from .events import (
     NightResolved,
     PhaseStarted,
     TableTalk,
+    VoteCast,
 )
 from .protocol import CommBus, Message
 from .engine import GameEngine
@@ -48,6 +50,20 @@ class Simulation:
         self.engine = GameEngine([a.name for a in agents], num_mafia=num_mafia, rng_seed=rng_seed)
         self.bus = CommBus()
         self._knowledge: dict[str, dict[str, Faction]] = {a.name: {} for a in agents}
+        self._dead: list[DeathRecord] = []
+
+    @property
+    def roles(self) -> dict[str, str]:
+        """Seat -> true role, readable the instant the table is seated.
+
+        The engine assigns roles inside `start()`, the first thing `run()`
+        does -- so this is meaningful from the moment the `game_started` event
+        has been yielded onward, well before any role is *narratively* revealed
+        (a lynch, or the final `game_ended`). It exists for callers -- like the
+        server's reveal endpoint -- that want to peek behind the curtain on
+        purpose, independent of what the table itself has figured out.
+        """
+        return {p.name: p.role.value for p in self.engine.players}
 
     def run(self) -> Iterator[GameEvent]:
         """Play one game start to finish, yielding a `GameEvent` for every observable moment."""
@@ -87,6 +103,13 @@ class Simulation:
         result = self.engine.resolve_night()
         for detective_name, (target_name, faction) in result.investigations.items():
             self._knowledge[detective_name][target_name] = faction
+        if result.killed:
+            self._dead.append(DeathRecord(
+                name=result.killed,
+                day_number=result.day_number,
+                cause="killed in the night",
+                revealed_role=None,
+            ))
 
         yield NightResolved(day_number=result.day_number, killed=result.killed, saved=result.saved)
 
@@ -99,14 +122,17 @@ class Simulation:
         yield PhaseStarted(phase="Day", day_number=self.engine.day_number, present=list(present))
 
         yield from self._run_discussion(present, Phase.DAY.value)
-
-        for player in self.engine.alive_players:
-            view = self._build_view(player.name)
-            target = self._agents[player.name].choose_vote(view)
-            self.engine.submit_vote(player.name, target)
+        yield from self._run_vote(present)
 
         result = self.engine.resolve_day()
         lynched_role = self.engine.get_player(result.lynched).role.value if result.lynched else None
+        if result.lynched:
+            self._dead.append(DeathRecord(
+                name=result.lynched,
+                day_number=result.day_number,
+                cause="lynched by the town's vote",
+                revealed_role=lynched_role,
+            ))
         yield DayResolved(
             day_number=result.day_number,
             lynched=result.lynched,
@@ -114,6 +140,28 @@ class Simulation:
             vote_counts=result.vote_counts,
             tied=result.tied,
         )
+
+    # ------------------------------------------------------------------
+    # The vote itself, cast one player at a time and narrated live so a
+    # frontend can visualize the tally building -- bars climbing, a leader
+    # emerging, a late swing -- rather than only the final headline result.
+    # ------------------------------------------------------------------
+    def _run_vote(self, present: tuple[str, ...]) -> Iterator[GameEvent]:
+        order = list(present)
+        self._rng.shuffle(order)
+        tally: Counter[str] = Counter()
+        for name in order:
+            view = self._build_view(name)
+            target = self._agents[name].choose_vote(view)
+            self.engine.submit_vote(name, target)
+            if target is not None:
+                tally[target] += 1
+            yield VoteCast(
+                day_number=self.engine.day_number,
+                voter=name,
+                target=target,
+                tally_so_far=dict(tally),
+            )
 
     # ------------------------------------------------------------------
     # The "queue" is just submission order: poll present agents in a
@@ -169,6 +217,7 @@ class Simulation:
             day_number=self.engine.day_number,
             phase=self.engine.phase,
             alive=tuple(p.name for p in self.engine.alive_players),
+            dead=tuple(self._dead),
             teammates=teammates,
             known_factions=dict(self._knowledge[name]),
             feed=tuple(self.bus.feed_for(name)),

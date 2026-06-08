@@ -27,6 +27,7 @@ from mafia_sim import (
     PhaseStarted,
     Simulation,
     TableTalk,
+    VoteCast,
 )
 
 DEFAULT_NAMES = [
@@ -66,6 +67,11 @@ def render_event(event: GameEvent) -> None:
         case TableTalk(sender=sender, cast=cast, to=to, content=content, day_number=day, phase=phase):
             shorthand = CastType(cast).shorthand
             print(f"    [{phase} {day}] {sender} -> {shorthand}: {','.join(to)} :: {content}")
+
+        case VoteCast(voter=voter, target=target, tally_so_far=tally):
+            cast = f"votes for {target}" if target else "abstains"
+            standings = ", ".join(f"{name}={count}" for name, count in sorted(tally.items(), key=lambda kv: -kv[1]))
+            print(f"    {voter} {cast}.  [tally so far: {standings or '(none yet)'}]")
 
         case NightResolved(killed=killed, saved=saved):
             if killed:

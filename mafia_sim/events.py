@@ -49,6 +49,21 @@ class NightResolved(BaseModel):
     saved: bool
 
 
+class VoteCast(BaseModel):
+    """One lynch vote landing live -- the running tally as it stands the instant after it.
+
+    Emitted as each player votes, in casting order, *before* `day_resolved`'s
+    final tally -- exactly what a frontend needs to animate the vote building
+    in real time (bars climbing, a leader emerging, a late swing) rather than
+    only being able to show the result once the dust has settled.
+    """
+    type: Literal["vote_cast"] = "vote_cast"
+    day_number: int
+    voter: str
+    target: str | None       # None = abstained
+    tally_so_far: dict[str, int]
+
+
 class DayResolved(BaseModel):
     type: Literal["day_resolved"] = "day_resolved"
     day_number: int
@@ -64,13 +79,14 @@ class GameEnded(BaseModel):
     roles: dict[str, str]  # player name -> role name, revealed once the game is over
 
 
-GameEvent = Union[GameStarted, PhaseStarted, TableTalk, NightResolved, DayResolved, GameEnded]
+GameEvent = Union[GameStarted, PhaseStarted, TableTalk, NightResolved, VoteCast, DayResolved, GameEnded]
 
 __all__ = [
     "GameStarted",
     "PhaseStarted",
     "TableTalk",
     "NightResolved",
+    "VoteCast",
     "DayResolved",
     "GameEnded",
     "GameEvent",

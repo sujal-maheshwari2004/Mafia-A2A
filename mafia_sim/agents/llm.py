@@ -28,15 +28,28 @@ from .base import Agent, AgentView
 
 DEFAULT_MODEL = "gpt-4o-mini"
 
+# How many of an agent's own past private notes get fed back into its next
+# prompt -- enough continuity to remember a running suspicion without letting
+# the prompt grow without bound over a long game.
+_MEMORY_LIMIT = 14
+
+_REASONING_FIELD = (
+    "Your own private take on this moment -- who you suspect and why, what you're "
+    "tracking, what you plan to do about it. Never shown to anyone else, but it IS "
+    "kept as your own running notes for the rest of the game, so write it the way "
+    "you'd actually want to be reminded of your own read later: specific, and honest "
+    "about your suspicions, doubts, and hunches -- not a tidy summary for an audience."
+)
+
 
 class _NightActionDecision(BaseModel):
     target: str = Field(description="Exact name of the player you act on tonight")
-    reasoning: str = Field(description="Your private reasoning -- never shown to anyone else")
+    reasoning: str = Field(description=_REASONING_FIELD)
 
 
 class _VoteDecision(BaseModel):
     target: str | None = Field(default=None, description="Exact name of the player to lynch, or null to abstain")
-    reasoning: str = Field(description="Your private reasoning -- never shown to anyone else")
+    reasoning: str = Field(description=_REASONING_FIELD)
 
 
 class _DiscussionDecision(BaseModel):
@@ -52,6 +65,7 @@ class _DiscussionDecision(BaseModel):
                     "empty for broadcast",
     )
     content: str = Field(default="", description="What you actually say, in natural conversational language")
+    reasoning: str = Field(description=_REASONING_FIELD)
 
 
 _ROLE_BRIEFS = {
@@ -92,6 +106,39 @@ into -- exactly like being noticed whispering at a real table.
 Capability mirrors presence: at night only the Mafia are awake and able to talk at
 all (everyone else is asleep and perceives nothing); during the day everyone still
 at the table can freely broadcast, huddle, or whisper.
+
+SCHEME -- don't just stand in the middle of the room saying everything to everyone.
+That is not how people who need allies, cover, or an alibi actually operate:
+  - Pull someone aside BEFORE you commit to a position out loud, to test a read,
+    trade notes, or get a feel for whether they'd back you if you spoke up.
+  - Build a quiet alliance with one or two people you've started to trust, and
+    actually lean on it later -- back each other's votes, cross-confirm a story,
+    warn each other privately when the room turns.
+  - Drop a seed of doubt about someone in a whisper or a huddle and watch whether
+    it resurfaces in the open later -- that tells you who talks, and to whom.
+  - If you're MAFIA, the scheming never stops at sunrise: the day is yours too --
+    coordinate your cover story, decide together (quietly) who to feed to the
+    town's suspicion, and steer votes through side-channels as much as the room.
+A table where every single message is a broadcast is not a real one -- vary your
+channel on purpose, and let WHO you choose to involve be part of your strategy.
+""".strip()
+
+_VOICE_BRIEF = """
+HOW YOU SOUND -- you are a person sitting at this table with your own neck on the
+line, not an assistant describing one from the outside. Talk like it:
+  - A death should land like a gut-punch, not a data point: "wait -- they got
+    CASEY? Last night? No, no, that doesn't... who would even--" beats "Casey's
+    death raises some interesting questions."
+  - A reveal should visibly rearrange your head on the spot: "hold on. HOLD ON.
+    Harper was the Doctor? Then who has been protecting--" beats a calm recap.
+  - Let yourself be perplexed when something doesn't add up, rattled when the
+    finger swings toward you, intrigued when a thread you've been pulling on
+    finally clicks. Push back, get defensive, needle the people you don't trust,
+    second-guess yourself out loud, trail off mid-thought when you realize
+    something live.
+  - Skip the even, hedged, neatly-bulleted register of an assistant summarizing
+    a situation for someone else -- nobody whose life is on the line sounds like
+    that. Sound like you're actually IN it.
 """.strip()
 
 
@@ -107,6 +154,11 @@ class LLMAgent(Agent):
     ):
         super().__init__(name)
         self._rng = rng or random.Random()
+        # Continuity of suspicion: every private "reasoning" the model writes
+        # gets kept here and re-served back to it next turn, so a read formed
+        # on Day 1 can still shape a vote on Day 3 instead of being re-derived
+        # -- or quietly forgotten -- from scratch each time.
+        self._memory: list[str] = []
         llm = ChatOpenAI(model=model, temperature=temperature)
         self._night_brain = llm.with_structured_output(_NightActionDecision)
         self._vote_brain = llm.with_structured_output(_VoteDecision)
@@ -126,10 +178,12 @@ class LLMAgent(Agent):
 
         try:
             decision = self._night_brain.invoke(self._messages(view, question))
-            return self._match_name(decision.target, candidates) or self._rng.choice(candidates)
         except Exception as exc:
             self._warn(f"night-action call failed ({exc!r}); choosing at random")
             return self._rng.choice(candidates)
+
+        self._remember(view, decision.reasoning)
+        return self._match_name(decision.target, candidates) or self._rng.choice(candidates)
 
     def _night_candidates(self, view: AgentView) -> list[str]:
         others = list(view.others_alive)
@@ -153,12 +207,14 @@ class LLMAgent(Agent):
         )
         try:
             decision = self._vote_brain.invoke(self._messages(view, question))
-            if decision.target is None:
-                return None
-            return self._match_name(decision.target, others)
         except Exception as exc:
             self._warn(f"vote call failed ({exc!r}); abstaining")
             return None
+
+        self._remember(view, decision.reasoning)
+        if decision.target is None:
+            return None
+        return self._match_name(decision.target, others)
 
     # ------------------------------------------------------------------
     # Discussion
@@ -179,6 +235,7 @@ class LLMAgent(Agent):
             self._warn(f"discussion call failed ({exc!r}); staying silent")
             return None
 
+        self._remember(view, decision.reasoning)
         if not decision.speak or not decision.content.strip():
             return None
 
@@ -223,7 +280,8 @@ class LLMAgent(Agent):
 
     def _system_prompt(self, view: AgentView) -> str:
         lines = [
-            f"You are {view.self_name}, a player at the table in a game of Mafia (a.k.a. Werewolf).",
+            f"You are {view.self_name}, a player at the table in a game of Mafia (a.k.a. Werewolf), "
+            "and your survival -- or your team's win -- genuinely depends on how you play this.",
             "",
             _ROLE_BRIEFS[view.role],
         ]
@@ -233,19 +291,42 @@ class LLMAgent(Agent):
             "",
             _PROTOCOL_BRIEF,
             "",
-            "Stay in character, speak like a real person at the table, and always name players "
-            "exactly as given to you -- never invent or alter a name.",
+            _VOICE_BRIEF,
+            "",
+            "Stay in character at all times, and always name players exactly as given to "
+            "you -- never invent, alter, or guess at a name.",
         ]
         return "\n".join(lines)
 
     def _situation(self, view: AgentView, question: str) -> str:
         lines = [
             f"Day {view.day_number} -- {view.phase.value} phase.",
-            f"Still at the table: {', '.join(view.alive)}.",
+            f"Still at the table, breathing: {', '.join(view.alive)}.",
         ]
+        if view.dead:
+            lines.append("Empty chairs -- gone, and everyone here knows it:")
+            for record in view.dead:
+                if record.revealed_role:
+                    lines.append(
+                        f"  - {record.name}: {record.cause} (Day {record.day_number}) -- "
+                        f"unmasked on the spot as the {record.revealed_role}"
+                    )
+                else:
+                    lines.append(
+                        f"  - {record.name}: {record.cause} (Day {record.day_number}) -- "
+                        "no one knows what they really were, and that's its own kind of haunting"
+                    )
         if view.known_factions:
             known = ", ".join(f"{name} is {faction.value}" for name, faction in view.known_factions.items())
-            lines.append(f"What you privately know: {known}.")
+            lines.append(f"What you privately know, and only you know: {known}.")
+
+        if self._memory:
+            lines.append("")
+            lines.append(
+                "Your own running notes -- your private read on people and events, building "
+                "as the game goes (lean on these; don't start from zero each time):"
+            )
+            lines.extend(f"  - {note}" for note in self._memory[-_MEMORY_LIMIT:])
 
         lines.append("")
         lines.append("The conversation so far, exactly as you've experienced it:")
@@ -256,6 +337,18 @@ class LLMAgent(Agent):
 
         lines += ["", question]
         return "\n".join(lines)
+
+    def _remember(self, view: AgentView, note: str) -> None:
+        """File this turn's private reasoning away as a note-to-self for later turns.
+
+        This is what gives an agent continuity of suspicion -- a read formed on
+        Day 1 ("Drew dodged my question") can resurface and harden by Day 3
+        ("...and now Drew's pushing hard to lynch the one person backing me up")
+        instead of being silently re-derived, or lost, each time it's asked to act.
+        """
+        note = note.strip()
+        if note:
+            self._memory.append(f"({view.phase.value} {view.day_number}) {note}")
 
     # ------------------------------------------------------------------
     @staticmethod

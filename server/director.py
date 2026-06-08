@@ -14,6 +14,7 @@ import asyncio
 import logging
 import random
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from mafia_sim import Agent, LLMAgent, Simulation
@@ -29,6 +30,18 @@ MODEL = "gpt-4o-mini"
 
 # Sentinel placed on the bridge queue once the worker thread has nothing left to send.
 _DONE = object()
+
+
+@dataclass(frozen=True)
+class _RolesRevealed:
+    """Bridge-only marker: the freshly-seated table's true seat -> role mapping.
+
+    Not a `GameEvent` -- it never goes out over the WebSocket, where roles stay
+    secret until the table itself reveals them. It exists purely to hand the
+    hub what `/game/roles` needs, the moment the table is seated.
+    """
+
+    roles: dict[str, str]
 
 
 def _next_hour_boundary(now: datetime | None = None) -> datetime:
@@ -54,7 +67,11 @@ def _play_in_background(seed: int, loop: asyncio.AbstractEventLoop, queue: async
     try:
         agents = _build_agents(seed)
         sim = Simulation(agents, rng_seed=seed)
-        for event in sim.run():
+        events = sim.run()
+        first = next(events)        # game_started -- the engine has now seated and assigned roles
+        relay(first)
+        relay(_RolesRevealed(sim.roles))
+        for event in events:
             relay(event)
     except Exception as exc:  # noqa: BLE001 -- surfaced to viewers, not swallowed
         relay(exc)
@@ -72,6 +89,9 @@ async def _run_one_game(hub: GameHub) -> None:
         item = await queue.get()
         if item is _DONE:
             return
+        if isinstance(item, _RolesRevealed):
+            hub.set_roles(item.roles)
+            continue
         if isinstance(item, Exception):
             logger.error("scheduled game ended in error: %s", item)
             hub.report_error(str(item))

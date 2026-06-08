@@ -66,6 +66,7 @@ class GameHub:
         self._mode: Mode = "idle"
         self._next_game_at: datetime | None = None
         self._subscribers: set[asyncio.Queue[BroadcastItem]] = set()
+        self._roles: dict[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Subscriber lifecycle
@@ -78,6 +79,18 @@ class GameHub:
 
     def unsubscribe(self, queue: "asyncio.Queue[BroadcastItem]") -> None:
         self._subscribers.discard(queue)
+
+    @property
+    def roles(self) -> dict[str, str] | None:
+        """Seat -> true role for the table currently (or most recently) seated.
+
+        Backs the `/game/roles` reveal endpoint -- a deliberate, out-of-band
+        peek behind the curtain for spectators who want one (a "reveal" toggle,
+        a who's-who overlay, ...), independent of and well ahead of whatever the
+        table itself has narratively figured out. `None` until the very first
+        table is seated.
+        """
+        return dict(self._roles) if self._roles is not None else None
 
     def _broadcast(self, item: BroadcastItem) -> None:
         for queue in self._subscribers:
@@ -99,6 +112,10 @@ class GameHub:
         self._mode = "live"
         self._next_game_at = None
         self._broadcast_status()
+
+    def set_roles(self, roles: dict[str, str]) -> None:
+        """Record the freshly-seated table's seat -> role mapping for the reveal endpoint."""
+        self._roles = dict(roles)
 
     def publish(self, event: GameEvent) -> None:
         self._events.append(event)

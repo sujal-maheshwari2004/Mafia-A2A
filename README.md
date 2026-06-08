@@ -128,6 +128,7 @@ JSON-serializable Pydantic model with a literal `type` tag:
 | `phase_started`   | `Night`/`Day`, day number, who's present |
 | `table_talk`      | one A2A message -- seq, sender, cast, recipients, content |
 | `night_resolved`  | who (if anyone) died, whether the doctor's save worked |
+| `vote_cast`       | one lynch vote landing live -- voter, target, the running tally so far |
 | `day_resolved`    | who (if anyone) was lynched and their revealed role, vote tally, tie |
 | `game_ended`      | the winning faction and everyone's final role |
 
@@ -168,11 +169,30 @@ frame is always a status frame:
 
 After that, every frame is the `model_dump(mode="json")` of one `GameEvent`
 from `mafia_sim.events` (`game_started`, `phase_started`, `table_talk`,
-`night_resolved`, `day_resolved`, `game_ended`), in the exact order the game
-produced them -- interleaved with further `status` frames whenever the
-schedule changes, and `{"type": "error", "message": "..."}` if a game hits
-trouble mid-stream. The connection stays open across games, so a viewer can
-simply leave it running; disconnect whenever you like.
+`night_resolved`, `vote_cast`, `day_resolved`, `game_ended`), in the exact
+order the game produced them -- interleaved with further `status` frames
+whenever the schedule changes, and `{"type": "error", "message": "..."}` if a
+game hits trouble mid-stream. The connection stays open across games, so a
+viewer can simply leave it running; disconnect whenever you like.
+
+Voting itself is streamed live, not just as a final headline: each `vote_cast`
+frame carries one player's vote (or abstention) plus the running tally the
+instant after it lands, in casting order -- everything a frontend needs to
+animate the count actually building (bars climbing, a leader emerging, a late
+swing) rather than only being able to show the result once `day_resolved`
+arrives with the final tally.
+
+### Who is who: `GET /game/roles`
+
+The WebSocket only ever reveals a seat's role when the *table itself* learns
+it -- a lynch unmasks the victim, `game_ended` unmasks everyone, exactly as a
+real game would. `GET /game/roles` is the deliberate exception: a plain JSON
+endpoint, `{"roles": {"Avery": "Mafia", ...}}`, that reveals the truth behind
+every seat at the currently- (or most recently-) seated table the moment it
+sits down -- a peek behind the curtain for a spectator UI that wants to offer
+one (a "reveal seats" toggle, a who's-who legend, face-down cards a viewer can
+choose to flip for themselves). Returns `{"roles": null}` before the very
+first table has ever been seated.
 
 Because LLM-backed agents make blocking network calls, the scheduled game is
 played out on its own background thread; its events are bridged onto the
