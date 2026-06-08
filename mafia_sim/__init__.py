@@ -1,6 +1,6 @@
 """Mafia simulator: a reusable game engine, an A2A comm protocol, agents, and a CLI."""
 
-from .agents import Agent, AgentView, DeathRecord, HeuristicAgent, LLMAgent
+from .agents import Agent, AgentView, DeathRecord, HeuristicAgent, LLMAgent, PERSONAS
 from .events import (
     DayResolved,
     GameEnded,
@@ -22,6 +22,7 @@ __all__ = [
     "DeathRecord",
     "HeuristicAgent",
     "LLMAgent",
+    "PERSONAS",
     "DayResolved",
     "GameEnded",
     "GameEvent",

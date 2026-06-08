@@ -143,7 +143,7 @@ is one example consumer; a React UI is another, fed the identical stream.
 over a single WebSocket endpoint, `/ws/game`. There's nothing to configure
 and nothing to wait for:
 
-- A fresh table of seven LLM-backed agents sits down **every hour, on the
+- A fresh table of ten LLM-backed agents sits down **every hour, on the
   hour** (`server/director.py`'s `direct_games` loop) -- there is never more
   than one `Simulation` running on the server at a time.
 - Every connection just subscribes to that one game's broadcast

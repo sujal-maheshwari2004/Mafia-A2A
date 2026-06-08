@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from mafia_sim import Agent, LLMAgent, Simulation
+from mafia_sim import PERSONAS, Agent, LLMAgent, Simulation
 from mafia_sim.events import GameEvent
 
 from .hub import GameHub
@@ -25,7 +25,11 @@ from .hub import GameHub
 logger = logging.getLogger("mafia.director")
 
 # The fixed table everyone tunes in to see -- no viewer ever configures this.
-PLAYER_NAMES = ["Avery", "Bailey", "Casey", "Drew", "Ellis", "Frankie", "Harper"]
+PLAYER_NAMES = [
+    "Avery", "Bailey", "Casey", "Drew", "Ellis",
+    "Frankie", "Harper", "Jordan", "Kai", "Logan",
+]
+NUM_MAFIA = 2
 MODEL = "gpt-4o-mini"
 
 # Sentinel placed on the bridge queue once the worker thread has nothing left to send.
@@ -50,7 +54,15 @@ def _next_hour_boundary(now: datetime | None = None) -> datetime:
 
 
 def _build_agents(seed: int) -> list[Agent]:
-    return [LLMAgent(name, model=MODEL, rng=random.Random(hash((name, seed)) & 0xFFFF)) for name in PLAYER_NAMES]
+    """Seat the table -- each player gets the same brain, a private rng, and one
+    of the fifteen `PERSONAS` dealt out at random so the room sounds like a
+    different group of people from game to game (never repeats a seat -- ten
+    players, fifteen personas, no two voices the same on a given night)."""
+    personas = random.Random(seed).sample(PERSONAS, len(PLAYER_NAMES))
+    return [
+        LLMAgent(name, model=MODEL, persona=persona, rng=random.Random(hash((name, seed)) & 0xFFFF))
+        for name, persona in zip(PLAYER_NAMES, personas)
+    ]
 
 
 def _play_in_background(seed: int, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
@@ -66,7 +78,7 @@ def _play_in_background(seed: int, loop: asyncio.AbstractEventLoop, queue: async
 
     try:
         agents = _build_agents(seed)
-        sim = Simulation(agents, rng_seed=seed)
+        sim = Simulation(agents, num_mafia=NUM_MAFIA, rng_seed=seed)
         events = sim.run()
         first = next(events)        # game_started -- the engine has now seated and assigned roles
         relay(first)
