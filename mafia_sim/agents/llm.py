@@ -23,7 +23,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from ..protocol import CastType, CommRequest
-from ..models import Role
+from ..models import Phase, Role
 from .base import Agent, AgentView
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -384,6 +384,21 @@ class LLMAgent(Agent):
             f"Day {view.day_number} -- {view.phase.value} phase.",
             f"Still at the table, breathing: {', '.join(view.alive)}.",
         ]
+        awake_with_you = [n for n in view.present if n != view.self_name]
+        if view.phase is Phase.NIGHT:
+            if awake_with_you:
+                lines.append(
+                    f"It's the dead of night -- everyone except you and {', '.join(awake_with_you)} "
+                    "is asleep and perceiving nothing right now. Whatever you say in this room, in "
+                    "whatever channel, reaches only the two (or few) of you who are actually awake -- "
+                    "NOT the wider table. This is your one private window to plan tonight together."
+                )
+            else:
+                lines.append(
+                    "It's the dead of night -- everyone else at the table is asleep and perceiving "
+                    "nothing. You're awake and alone with this choice; there's no one to talk to and "
+                    "no one listening, however you might phrase it."
+                )
         if view.dead:
             lines.append("Empty chairs -- gone, and everyone here knows it:")
             for record in view.dead:

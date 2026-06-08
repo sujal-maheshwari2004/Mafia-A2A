@@ -96,7 +96,10 @@ class Simulation:
 
         for player in self.engine.alive_players:
             if player.role in (Role.MAFIA, Role.DOCTOR, Role.DETECTIVE):
-                view = self._build_view(player.name)
+                # Mafia are awake together; the Doctor and Detective each act alone,
+                # with no one else awake to perceive them.
+                present = mafia_present if player.role is Role.MAFIA else (player.name,)
+                view = self._build_view(player.name, present=present)
                 target = self._agents[player.name].choose_night_target(view)
                 self.engine.submit_night_action(player.name, target)
 
@@ -151,7 +154,7 @@ class Simulation:
         self._rng.shuffle(order)
         tally: Counter[str] = Counter()
         for name in order:
-            view = self._build_view(name)
+            view = self._build_view(name, present=present)
             target = self._agents[name].choose_vote(view)
             self.engine.submit_vote(name, target)
             if target is not None:
@@ -174,7 +177,7 @@ class Simulation:
             self._rng.shuffle(order)
             anyone_spoke = False
             for name in order:
-                view = self._build_view(name)
+                view = self._build_view(name, present=present)
                 request = self._agents[name].discussion_turn(view)
                 if request is None:
                     continue
@@ -203,7 +206,7 @@ class Simulation:
         )
 
     # ------------------------------------------------------------------
-    def _build_view(self, name: str) -> AgentView:
+    def _build_view(self, name: str, present: tuple[str, ...]) -> AgentView:
         player = self.engine.get_player(name)
         teammates: tuple[str, ...] = ()
         if player.role is Role.MAFIA:
@@ -217,6 +220,7 @@ class Simulation:
             day_number=self.engine.day_number,
             phase=self.engine.phase,
             alive=tuple(p.name for p in self.engine.alive_players),
+            present=present,
             dead=tuple(self._dead),
             teammates=teammates,
             known_factions=dict(self._knowledge[name]),

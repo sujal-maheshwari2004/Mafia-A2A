@@ -38,6 +38,7 @@ class AgentView:
     day_number: int
     phase: Phase
     alive: tuple[str, ...]
+    present: tuple[str, ...]               # who can actually hear/see you right now (vs. merely alive)
     dead: tuple[DeathRecord, ...]           # gone from the table, in the order they fell
     teammates: tuple[str, ...]              # fellow mafia, if you are one
     known_factions: dict[str, Faction]      # learned via investigation, etc.
