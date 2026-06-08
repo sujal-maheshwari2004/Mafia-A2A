@@ -138,22 +138,47 @@ is one example consumer; a React UI is another, fed the identical stream.
 
 ## Live streaming server (`server/`)
 
-`server/app.py` is a small FastAPI app exposing one WebSocket endpoint,
-`/ws/game`:
+`server/app.py` is a small FastAPI app that streams *the one shared game*
+over a single WebSocket endpoint, `/ws/game`. There's nothing to configure
+and nothing to wait for:
 
-1. Connect, then send a single JSON config message (all fields optional):
-   ```json
-   {"count": 7, "seed": 42, "brain": "heuristic", "model": "gpt-4o-mini"}
-   ```
-2. The server plays one full game and streams back every `GameEvent` as JSON,
-   in the exact order the game produced them, until `game_ended` -- then
-   closes the socket.
+- A fresh table of seven LLM-backed agents sits down **every hour, on the
+  hour** (`server/director.py`'s `direct_games` loop) -- there is never more
+  than one `Simulation` running on the server at a time.
+- Every connection just subscribes to that one game's broadcast
+  (`server/hub.py`'s `GameHub`). Connect any time and you're caught up
+  *instantly*: mid-game, you get everything that's happened so far followed
+  by the rest live; between games, you get the last completed game's full
+  transcript followed by live coverage of the next one the moment it starts.
 
-Because LLM-backed agents make blocking network calls, each game is played
-out on its own background thread; its events are bridged onto the asyncio
-event loop via a queue (`loop.call_soon_threadsafe`) so a slow LLM call can
-never stall the server. Bad configs, a missing `OPENAI_API_KEY`, or any
-in-game error surface as `{"type": "error", "message": "..."}` frames.
+Connect and frames start flowing immediately -- no config message. The first
+frame is always a status frame:
+
+```json
+{"type": "status", "mode": "live" | "replay" | "idle", "next_game_at": "2024-01-01T15:00:00Z" | null}
+```
+
+- `"live"` -- a game is in progress; what follows catches you up on it, then
+  continues live.
+- `"replay"` -- the table's empty right now; what follows is the last
+  completed game's full transcript, then live coverage of the next one once
+  `next_game_at` arrives.
+- `"idle"` -- the very first game hasn't started yet; just wait for
+  `next_game_at`.
+
+After that, every frame is the `model_dump(mode="json")` of one `GameEvent`
+from `mafia_sim.events` (`game_started`, `phase_started`, `table_talk`,
+`night_resolved`, `day_resolved`, `game_ended`), in the exact order the game
+produced them -- interleaved with further `status` frames whenever the
+schedule changes, and `{"type": "error", "message": "..."}` if a game hits
+trouble mid-stream. The connection stays open across games, so a viewer can
+simply leave it running; disconnect whenever you like.
+
+Because LLM-backed agents make blocking network calls, the scheduled game is
+played out on its own background thread; its events are bridged onto the
+asyncio event loop via a queue (`loop.call_soon_threadsafe`) and handed to
+the hub, which fans them out to every subscriber, so a slow LLM call can
+never stall the server or any viewer's socket.
 
 Run it with:
 
@@ -165,12 +190,18 @@ and point a frontend at `ws://<host>:<port>/ws/game`.
 
 ## Configuration
 
-LLM-backed agents (`--brain llm` / `--brain mixed`, or `"brain": "llm"` over
-the WebSocket) need an OpenAI API key in the environment:
+The scheduled game is LLM-backed, so the server needs an OpenAI API key in
+the environment to play it:
 
 ```bash
 export OPENAI_API_KEY=sk-...        # bash
 $env:OPENAI_API_KEY = "sk-..."      # PowerShell
 ```
 
-`HeuristicAgent` games need nothing extra and run instantly offline.
+Without it, the hourly games will fail to play (the server logs a warning at
+startup and an `error` frame is broadcast to viewers when a scheduled game
+can't run).
+
+`main.py`, `spectate.py`, and `mafia_sim`'s `HeuristicAgent` are unaffected
+by any of this -- they still let you play or watch one-off games offline,
+with whichever brain you like, straight from the CLI.
