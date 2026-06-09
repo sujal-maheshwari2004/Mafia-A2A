@@ -76,7 +76,9 @@ _ROLE_BRIEFS = {
     Role.MAFIA: (
         "You are MAFIA. Each night you and your teammates secretly choose one player to eliminate. "
         "You win once the Mafia equal or outnumber the Town. Blend in, deflect suspicion, and "
-        "steer the Town's votes toward townsfolk -- especially anyone who seems to be figuring you out."
+        "steer the Town's votes toward townsfolk -- especially anyone who seems to be figuring you out. "
+        "CRITICAL: You must NEVER vote to lynch one of your own Mafia teammates. Doing so hands the "
+        "Town a free win. Always vote for a Town player, or abstain if needed."
     ),
     Role.DOCTOR: (
         "You are the DOCTOR. Each night you may protect one player (including yourself) from the "
@@ -272,6 +274,10 @@ class LLMAgent(Agent):
         # on Day 1 can still shape a vote on Day 3 instead of being re-derived
         # -- or quietly forgotten -- from scratch each time.
         self._memory: list[str] = []
+        # Keyed by "day:phase" -- what this agent actually said each phase.
+        # Injected back into every prompt so the model doesn't keep re-sending
+        # the same message (the 12-confirmation night-coordination problem).
+        self._phase_transcript: dict[str, list[str]] = {}
         llm = ChatOpenAI(model=model, temperature=temperature)
         self._night_brain = llm.with_structured_output(_NightActionDecision)
         self._vote_brain = llm.with_structured_output(_VoteDecision)
@@ -339,14 +345,22 @@ class LLMAgent(Agent):
         if not others:
             return None
 
+        pressure_lines = self._today_accusation_summary(view, others)
+        pressure_str = (
+            "\n".join(f"  - {s}" for s in pressure_lines)
+            if pressure_lines
+            else "  (no clear accusation target from today's discussion)"
+        )
         question = (
-            "Time to vote. Who do you lynch -- or do you abstain?\n"
-            "Don't just vote for whoever's been accused the most. Think about behavioral "
-            "signals: Who has been deflecting instead of asking? Who defended an accused "
-            "player faster than the evidence warranted? Who went quiet at exactly the wrong "
-            "moment? Whose read keeps conveniently shifting? If you have no real signal, "
-            "abstaining beats killing a townie -- but be honest about whether that's caution "
-            "or avoidance."
+            f"Time to vote. Today's discussion named these players most often:\n{pressure_str}\n\n"
+            "This is real signal -- the room built it over this whole day phase. "
+            "Don't throw it away. Vote for the player the discussion pointed at most strongly, "
+            "unless you have a specific reason to believe that momentum was manufactured.\n\n"
+            "That said, don't ONLY look at counts: Who has been deflecting instead of asking? "
+            "Who defended an accused player faster than the evidence warranted? "
+            "Whose read keeps conveniently shifting? "
+            "If you have no real signal at all, abstaining beats killing a townie -- "
+            "but be honest about whether that's caution or avoidance."
         )
         try:
             decision = self._vote_brain.invoke(self._messages(view, question))
@@ -373,17 +387,29 @@ class LLMAgent(Agent):
 
         if view.phase is Phase.NIGHT:
             killable = [n for n in view.others_alive if n not in view.teammates]
-            question = (
-                "This is your private huddle with your fellow Mafia, before each of you separately "
-                "names tonight's target -- no one else at the table can hear a word of it, however "
-                "you choose to phrase it. This is your one chance all night to actually talk: settle "
-                f"on who you're taking out and why -- the only people left to take out are "
-                f"{', '.join(killable)}, so don't waste the huddle floating a name that's already an "
-                "empty chair -- trade reads on who's getting close to the truth, line up your cover "
-                "story for the morning, or warn each other what to watch for. Passing here means "
-                "walking in tomorrow with no plan and no story straight -- decide whether that's "
-                "really the move, and if you do speak, choose your channel on purpose."
-            )
+            agreed_target = self._agreed_kill_target(view, killable)
+            if agreed_target:
+                question = (
+                    f"Your team has already agreed to eliminate {agreed_target} tonight -- "
+                    "the decision is made, repeating it adds nothing. "
+                    "If you speak now, spend it on something useful: your cover story for tomorrow, "
+                    "who to redirect suspicion onto, what to watch for in the morning discussion, "
+                    "or who the next target should be. "
+                    "If there's nothing new to say, stay silent (speak=false) -- "
+                    "a quiet night is better than confirming the same name a fifth time."
+                )
+            else:
+                question = (
+                    "This is your private huddle with your fellow Mafia, before each of you separately "
+                    "names tonight's target -- no one else at the table can hear a word of it, however "
+                    "you choose to phrase it. This is your one chance all night to actually talk: settle "
+                    f"on who you're taking out and why -- the only people left to take out are "
+                    f"{', '.join(killable)}, so don't waste the huddle floating a name that's already an "
+                    "empty chair -- trade reads on who's getting close to the truth, line up your cover "
+                    "story for the morning, or warn each other what to watch for. Passing here means "
+                    "walking in tomorrow with no plan and no story straight -- decide whether that's "
+                    "really the move, and if you do speak, choose your channel on purpose."
+                )
         else:
             question = (
                 "Your turn. What's your move?\n"
@@ -413,7 +439,32 @@ class LLMAgent(Agent):
             cast = CastType.UNICAST
 
         to = self._resolve_recipients(cast, decision.to, others)
-        return CommRequest(cast, to, decision.content.strip())
+        content = decision.content.strip()
+        phase_key = f"{view.day_number}:{view.phase.value}"
+        self._phase_transcript.setdefault(phase_key, []).append(content)
+        return CommRequest(cast, to, content)
+
+    def _agreed_kill_target(self, view: AgentView, killable: list[str]) -> str | None:
+        """Return a target name if teammates (incl. self) have mentioned the same name ≥2 times
+        in tonight's huddle -- meaning the kill is already agreed and doesn't need re-confirming."""
+        from collections import Counter as _Counter
+        mentions: _Counter[str] = _Counter()
+        for sighting in view.feed:
+            if not sighting.is_content_known:
+                continue
+            if sighting.day_number != view.day_number or sighting.phase_label != Phase.NIGHT.value:
+                continue
+            if sighting.sender not in view.teammates and sighting.sender != view.self_name:
+                continue
+            text = sighting.content.lower()
+            for name in killable:
+                if name.lower() in text:
+                    mentions[name] += 1
+        if mentions:
+            top, count = mentions.most_common(1)[0]
+            if count >= 2:
+                return top
+        return None
 
     def _resolve_recipients(self, cast: CastType, raw_to: list[str], others: list[str]) -> tuple[str, ...]:
         if cast is CastType.BROADCAST:
@@ -533,6 +584,17 @@ class LLMAgent(Agent):
             )
             lines.extend(f"  - {note}" for note in self._memory[-_MEMORY_LIMIT:])
 
+        phase_key = f"{view.day_number}:{view.phase.value}"
+        own_msgs = self._phase_transcript.get(phase_key, [])
+        if own_msgs:
+            lines.append("")
+            lines.append(
+                "What YOU have already said this phase -- each of these has been heard. "
+                "Do NOT repeat or rephrase any of them. If you'd say the same thing again, "
+                "stay silent instead (speak=false). Say something new or say nothing:"
+            )
+            lines.extend(f"  - \"{msg}\"" for msg in own_msgs[-6:])
+
         lines.append("")
         lines.append("The conversation so far, exactly as you've experienced it:")
         feed = list(view.feed)
@@ -546,6 +608,32 @@ class LLMAgent(Agent):
 
         lines += ["", question]
         return "\n".join(lines)
+
+    def _today_accusation_summary(self, view: AgentView, others: list[str]) -> list[str]:
+        """How many times each live player was named accusatorily in today's discussion."""
+        from collections import Counter as _Counter
+        _ACC_KW = (
+            "suspicious", "suspect", "mafia", "accuse", "vote out", "voting",
+            "lying", "liar", "hiding", "not who they say", "cover",
+        )
+        tally: _Counter[str] = _Counter()
+        alive_set = set(others)
+        for sighting in view.feed:
+            if not sighting.is_content_known:
+                continue
+            if sighting.day_number != view.day_number or sighting.phase_label != Phase.DAY.value:
+                continue
+            text = sighting.content.lower()
+            if not any(kw in text for kw in _ACC_KW):
+                continue
+            for name in alive_set:
+                if name.lower() in text and name != sighting.sender:
+                    tally[name] += 1
+        return [
+            f"{name} -- accused {count} time{'s' if count != 1 else ''} in today's discussion"
+            for name, count in tally.most_common(5)
+            if count > 0
+        ]
 
     def _extract_signals(self, view: AgentView) -> list[str]:
         """Pre-parsed intelligence signals the agent can act on right now.

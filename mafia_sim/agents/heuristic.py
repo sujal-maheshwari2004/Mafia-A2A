@@ -182,9 +182,20 @@ class HeuristicAgent(Agent):
 
         phase_key = f"{view.day_number}:{view.phase.value}"
 
-        said_so_far = sum(
-            1 for s in view.feed if s.day_number == view.day_number and s.phase_label == view.phase.value
+        own_said = sum(
+            1 for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+            and s.sender == view.self_name
         )
+        total_said = sum(
+            1 for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+        )
+        # Own messages drive personal decay heavily; total messages add a light shared dampening
+        # so agents who've contributed a lot back off while silent observers also slow down gently.
+        said_so_far = own_said * 3 + total_said * 0.1
         if self._rng.random() > self._chattiness / (1 + said_so_far * 0.15):
             return None
 
@@ -355,7 +366,11 @@ class HeuristicAgent(Agent):
     # Feed analysis
     # ------------------------------------------------------------------
     def _accusation_pressure(self, view: AgentView) -> Counter[str]:
-        """How many accusatory messages have named each player."""
+        """How many accusatory messages have named each player.
+
+        Messages from the current day's discussion phase count 3× -- they
+        represent fresh consensus that should dominate over older residue.
+        """
         tally: Counter[str] = Counter()
         names = set(view.alive) - {view.self_name}
         for sighting in view.feed:
@@ -364,9 +379,14 @@ class HeuristicAgent(Agent):
             text = sighting.content.lower()
             if not any(kw in text for kw in _ACCUSATION_KEYWORDS):
                 continue
+            is_today_day = (
+                sighting.day_number == view.day_number
+                and sighting.phase_label == Phase.DAY.value
+            )
+            weight = 3 if is_today_day else 1
             for name in names:
                 if name != sighting.sender and name.lower() in text:
-                    tally[name] += 1
+                    tally[name] += weight
         return tally
 
     def _claim_tracker(self, view: AgentView) -> dict[str, str]:

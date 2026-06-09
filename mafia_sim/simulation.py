@@ -173,9 +173,13 @@ class Simulation:
     # ------------------------------------------------------------------
     def _run_discussion(self, present: tuple[str, ...], phase_label: str) -> Iterator[GameEvent]:
         order = list(present)
-        # A "stale" pass is one where fewer than 1-in-4 seats spoke -- two in a
-        # row signals the conversation has run out of new things to say.
+        # A "stale" pass is one where fewer than 1-in-4 seats spoke.
+        # Two consecutive stale passes signals the conversation has run out of
+        # new things to say.  We only start counting after the first active pass
+        # so that a quiet opening pass (agents observing after a fresh death or
+        # reveal) doesn't incorrectly cut the conversation short.
         min_speakers = max(1, len(present) // 4)
+        had_active_pass = False
         stale_passes = 0
         for _ in range(MAX_DISCUSSION_PASSES):
             self._rng.shuffle(order)
@@ -196,12 +200,13 @@ class Simulation:
                 yield self._table_talk_event(message)
             if speakers_this_pass == 0:
                 break
-            if speakers_this_pass < min_speakers:
+            if speakers_this_pass >= min_speakers:
+                had_active_pass = True
+                stale_passes = 0
+            elif had_active_pass:
                 stale_passes += 1
                 if stale_passes >= 2:
                     break
-            else:
-                stale_passes = 0
 
     @staticmethod
     def _table_talk_event(message: Message) -> TableTalk:
