@@ -173,9 +173,13 @@ class Simulation:
     # ------------------------------------------------------------------
     def _run_discussion(self, present: tuple[str, ...], phase_label: str) -> Iterator[GameEvent]:
         order = list(present)
+        # A "stale" pass is one where fewer than 1-in-4 seats spoke -- two in a
+        # row signals the conversation has run out of new things to say.
+        min_speakers = max(1, len(present) // 4)
+        stale_passes = 0
         for _ in range(MAX_DISCUSSION_PASSES):
             self._rng.shuffle(order)
-            anyone_spoke = False
+            speakers_this_pass = 0
             for name in order:
                 view = self._build_view(name, present=present)
                 request = self._agents[name].discussion_turn(view)
@@ -188,10 +192,16 @@ class Simulation:
                     day_number=self.engine.day_number,
                     phase_label=phase_label,
                 )
-                anyone_spoke = True
+                speakers_this_pass += 1
                 yield self._table_talk_event(message)
-            if not anyone_spoke:
+            if speakers_this_pass == 0:
                 break
+            if speakers_this_pass < min_speakers:
+                stale_passes += 1
+                if stale_passes >= 2:
+                    break
+            else:
+                stale_passes = 0
 
     @staticmethod
     def _table_talk_event(message: Message) -> TableTalk:

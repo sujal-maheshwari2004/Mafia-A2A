@@ -33,6 +33,10 @@ DEFAULT_MODEL = "gpt-4o-mini"
 # the prompt grow without bound over a long game.
 _MEMORY_LIMIT = 14
 
+# Cap on feed entries injected into each prompt -- prevents the model from
+# pattern-matching on a wall of near-identical messages in long games.
+_FEED_WINDOW = 25
+
 _REASONING_FIELD = (
     "Your own private take on this moment -- who you suspect and why, what you're "
     "tracking, what you plan to do about it. Never shown to anyone else, but it IS "
@@ -531,8 +535,12 @@ class LLMAgent(Agent):
 
         lines.append("")
         lines.append("The conversation so far, exactly as you've experienced it:")
-        if view.feed:
-            lines.extend(f"  {sighting.render()}" for sighting in view.feed)
+        feed = list(view.feed)
+        if len(feed) > _FEED_WINDOW:
+            lines.append(f"  ... ({len(feed) - _FEED_WINDOW} earlier messages omitted) ...")
+            feed = feed[-_FEED_WINDOW:]
+        if feed:
+            lines.extend(f"  {sighting.render()}" for sighting in feed)
         else:
             lines.append("  (nothing yet)")
 
