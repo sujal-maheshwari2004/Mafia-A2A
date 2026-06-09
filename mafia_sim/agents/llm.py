@@ -64,7 +64,7 @@ class _DiscussionDecision(BaseModel):
         description="Recipients by exact name: exactly one for unicast, two or more for multicast, "
                     "empty for broadcast",
     )
-    content: str = Field(default="", description="What you actually say, in natural conversational language")
+    content: str = Field(default="", description="What you actually say -- short, in your character's voice (1-3 sentences). React to the moment; don't summarize it. Don't explain your reasoning; let the statement or question land on its own.")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
@@ -146,6 +146,35 @@ line, not an assistant describing one from the outside. Talk like it:
   - Skip the even, hedged, neatly-bulleted register of an assistant summarizing
     a situation for someone else -- nobody whose life is on the line sounds like
     that. Sound like you're actually IN it.
+  - KEEP IT SHORT. Real table talk is one sharp sentence, not a prepared speech.
+    One accusation. One pointed question. One cutting comeback. Two or three sentences
+    is almost always enough -- more than that and you're narrating, not playing.
+  - YOUR PERSONA shapes every single word. A blunt character doesn't say "I have
+    some concerns" -- they say "I don't buy it." A charmer leads with your name.
+    A rambler circles back around. Don't drift into generic player voice; stay in
+    your specific register at all times.
+""".strip()
+
+_INTEL_BRIEF = """
+INTELLIGENCE -- half the game is closing the gap between what you know and what is
+actually true.  Don't just state your beliefs -- go get the information you're missing.
+
+  QUESTIONS are moves.  "What's your read?" or "Why did you defend them so fast?"
+  puts someone on record.  The answer is data.  The dodge is also data.
+
+  SILENCE calls for pressure.  If someone hasn't said anything while accusations are
+  flying, that is a choice -- naming it forces a reaction you can read.
+
+  CLAIMS need scrutiny.  Anyone saying they're the Detective or Doctor is either
+  telling the truth or hiding behind it.  Ask for specifics: "What did you find?" or
+  "Who did you protect?" -- a real claim survives the question; a fake one cracks.
+
+  DEFENDERS are a tell.  Whoever rushes to cover an accused player is either their
+  ally or desperately hoping you won't look too closely.  Either is worth probing.
+
+  PRIVATE CHANNELS are intelligence ops.  A whisper to one person, then watching
+  whether it surfaces publicly, tells you whether that person is talking to the other
+  side.  Ask privately before committing publicly.  A leak is a connection confirmed.
 """.strip()
 
 # Fifteen distinct table personalities -- one is handed to each seat at random
@@ -250,10 +279,35 @@ class LLMAgent(Agent):
     def choose_night_target(self, view: AgentView) -> str:
         candidates = self._night_candidates(view)
         question = {
-            Role.MAFIA: "Night falls. Who do you and your fellow Mafia choose to eliminate tonight? "
-                        "(You cannot target your own teammates.)",
-            Role.DOCTOR: "Night falls. Who do you protect tonight? (You may choose yourself.)",
-            Role.DETECTIVE: "Night falls. Who do you investigate tonight?",
+            Role.MAFIA: (
+                "Night falls. Who do you eliminate?\n"
+                "Think about who is most dangerous to your team right now: Has anyone claimed "
+                "to be the Detective or revealed an investigation result? They are your top "
+                "priority -- kill them first. If not, who has been asking the sharpest "
+                "questions or building momentum the Town might follow? Who has been quiet but "
+                "tracking everything -- a silent observer with a good read is more dangerous "
+                "than a loud one who telegraphs their reasoning. Pick the person whose silence "
+                "tomorrow costs the Town the most.\n"
+                "You cannot target your own teammates."
+            ),
+            Role.DOCTOR: (
+                "Night falls. Who do you protect?\n"
+                "The Mafia kills whoever is closest to exposing them. Think: has anyone "
+                "publicly claimed to be the Detective? If so, protect them -- that is almost "
+                "certainly tonight's target. Otherwise, who has been leading the accusation, "
+                "asking the sharpest questions, or building real momentum? Protect whoever "
+                "made the most progress today; the Mafia wants them silenced. Protect yourself "
+                "only if you genuinely believe you are the target tonight."
+            ),
+            Role.DETECTIVE: (
+                "Night falls. You investigate one player and get back a confirmed Town or Mafia.\n"
+                "Don't waste this on someone you've already written off. Think about your "
+                "biggest open question: Who has claimed a role you can't verify? Who has been "
+                "defending the most suspicious player -- a defender of the guilty is often "
+                "their partner. Who has been suspiciously quiet at exactly the moments a Town "
+                "player would have spoken up? Whoever you investigate tonight is confirmed or "
+                "cleared -- choose the name that resolves the most."
+            ),
         }[view.role]
 
         try:
@@ -282,8 +336,13 @@ class LLMAgent(Agent):
             return None
 
         question = (
-            "It's time to vote. Who do you vote to lynch today? If you genuinely have no read, "
-            "you may abstain by leaving the target null."
+            "Time to vote. Who do you lynch -- or do you abstain?\n"
+            "Don't just vote for whoever's been accused the most. Think about behavioral "
+            "signals: Who has been deflecting instead of asking? Who defended an accused "
+            "player faster than the evidence warranted? Who went quiet at exactly the wrong "
+            "moment? Whose read keeps conveniently shifting? If you have no real signal, "
+            "abstaining beats killing a townie -- but be honest about whether that's caution "
+            "or avoidance."
         )
         try:
             decision = self._vote_brain.invoke(self._messages(view, question))
@@ -323,9 +382,14 @@ class LLMAgent(Agent):
             )
         else:
             question = (
-                "It's your moment to optionally speak. Decide whether to say something right now, and "
-                "if so, choose your channel and audience deliberately -- broadcasting, huddling, and "
-                "whispering each send a different signal to the room. If you'd rather wait and listen, pass."
+                "Your turn. What's your move?\n"
+                "Remember: information you don't have yet is working against you. The most "
+                "valuable thing you can do right now might be asking, not telling -- a "
+                "question puts someone on record and forces a reaction. Name someone's "
+                "silence. Press a claim that hasn't been verified. Whisper to one person "
+                "to test a read before committing publicly.\n"
+                "If you speak: keep it short, in your own voice, choose your channel on "
+                "purpose. If you'd rather observe this round, passing is also a real move."
             )
         try:
             decision = self._discussion_brain.invoke(self._messages(view, question))
@@ -389,13 +453,16 @@ class LLMAgent(Agent):
             "",
             _PROTOCOL_BRIEF,
             "",
+            _INTEL_BRIEF,
+            "",
             _VOICE_BRIEF,
         ]
         if self._persona:
             lines += [
                 "",
-                f"WHO YOU ARE AT THIS TABLE -- on top of all of that, this is specifically "
-                f"you, distinct from your role and your goals: {self._persona}",
+                f"WHO YOU ARE AT THIS TABLE -- this is the specific person you are, "
+                f"distinct from your role and your goals.  Every word out of your mouth "
+                f"must sound like this character, not a generic Mafia player: {self._persona}",
             ]
         lines += [
             "",
@@ -448,6 +515,12 @@ class LLMAgent(Agent):
             lines.append("the words, but no one slips off with someone else unnoticed at this table:")
             lines.extend(f"  - {' and '.join(group)} are off in their own exchange" for group in huddles)
 
+        signals = self._extract_signals(view)
+        if signals:
+            lines.append("")
+            lines.append("Intelligence signals -- patterns worth acting on, pre-parsed from the conversation:")
+            lines.extend(f"  - {s}" for s in signals)
+
         if self._memory:
             lines.append("")
             lines.append(
@@ -465,6 +538,69 @@ class LLMAgent(Agent):
 
         lines += ["", question]
         return "\n".join(lines)
+
+    def _extract_signals(self, view: AgentView) -> list[str]:
+        """Pre-parsed intelligence signals the agent can act on right now.
+
+        The raw feed carries all of this in principle, but surfacing it as a
+        short labelled list means the model doesn't have to re-derive the same
+        patterns each turn -- and is more likely to actually use them.
+        """
+        _CLAIM_MARKERS: dict[str, tuple[str, ...]] = {
+            "Detective": ("detective", "i investigated", "i checked", "came back"),
+            "Doctor": ("doctor", "i saved", "i protected", "i healed"),
+        }
+        _DEFENSE_MARKERS = ("i trust", "is innocent", "not mafia", "vouch", "i believe", "i'll back", "backing")
+
+        claims: dict[str, str] = {}
+        defenders: dict[str, list[str]] = {}
+        speakers: set[str] = set()
+        alive_names = set(view.alive) - {view.self_name}
+
+        for sighting in view.feed:
+            if not sighting.is_content_known:
+                continue
+            sender = sighting.sender
+            text = sighting.content.lower()
+            # Role claims
+            if sender != view.self_name and sender not in claims:
+                for role_str, markers in _CLAIM_MARKERS.items():
+                    if any(m in text for m in markers):
+                        claims[sender] = role_str
+                        break
+            # Defenders: someone vouching for another by name
+            if any(m in text for m in _DEFENSE_MARKERS):
+                for name in alive_names:
+                    if name.lower() in text and name != sender:
+                        defenders.setdefault(name, [])
+                        if sender not in defenders[name]:
+                            defenders[name].append(sender)
+            # Track who has spoken this phase
+            if sighting.day_number == view.day_number and sighting.phase_label == view.phase.value:
+                speakers.add(sender)
+
+        signals: list[str] = []
+
+        # Role claims + who's backed them
+        for claimant, role_str in claims.items():
+            backed_by = defenders.get(claimant, [])
+            note = f"backed by {', '.join(backed_by)}" if backed_by else "no one has challenged or confirmed this"
+            signals.append(f"{claimant} has claimed {role_str} ({note})")
+
+        # Players who've been publicly vouched for (not just claimants)
+        for defended, defends in defenders.items():
+            if defended not in claims and len(defends) >= 1:
+                who = ", ".join(defends)
+                signals.append(f"{who} {'has' if len(defends) == 1 else 'have'} been publicly backing {defended}")
+
+        # Silent players this phase (day only -- night silence is expected for sleepers)
+        if view.phase is Phase.DAY:
+            present_others = [n for n in view.present if n != view.self_name]
+            silent = [n for n in present_others if n not in speakers]
+            if silent:
+                signals.append(f"Has not said a word this phase: {', '.join(silent)}")
+
+        return signals
 
     def _active_huddles(self, view: AgentView) -> list[tuple[str, ...]]:
         """Side conversations visibly underway right now, as the room would see them.

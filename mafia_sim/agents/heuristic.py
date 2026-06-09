@@ -1,12 +1,20 @@
 """A fully rule-based agent -- no LLM required.
 
-It reasons only from what the A2A protocol actually exposes to it: its own
-role, anything it has privately learned (investigations, mafia teammates),
-and the shape + content of everything that has passed through its feed.
-"Suspicion" is a live tally recomputed from the feed each time a decision is
-needed -- there's no hidden state beyond what a human re-scanning the table
-talk could plausibly notice. This keeps it a fair, swappable baseline next to
-future LLM-backed agents that reason over the same view more richly.
+Reasons from everything the A2A protocol exposes: its own role, private
+knowledge (investigations, mafia teammates), and the full shape + content of
+its personal feed.  Six kinds of signal are tracked and acted on each turn:
+
+  accusation pressure   -- who is being named in suspicious/accusatory messages
+  defense strength      -- who is being vouched for and trusted
+  role claims           -- who has verbally claimed detective or doctor
+  activity level        -- who is speaking and who has gone quiet
+  private channel shape -- who is huddling privately with whom
+  threat level          -- who is most actively accusing / investigating (Mafia view)
+
+Information-seeking is a first-class behavior: the agent regularly asks direct
+questions to put players on record, probes unverified role claims, and uses
+silence as a signal worth pressuring.  A player who never asks questions is
+half-blind -- they can only reason from what others volunteer.
 """
 
 from __future__ import annotations
@@ -18,7 +26,51 @@ from ..protocol import CastType, CommRequest
 from ..models import Faction, Phase, Role
 from .base import Agent, AgentView
 
-_SUSPICION_KEYWORDS = ("suspicious", "suspect", "mafia", "accuse", "vote out", "lying", "liar")
+_ACCUSATION_KEYWORDS = (
+    "suspicious", "suspect", "mafia", "accuse", "vote out", "voting out",
+    "lying", "liar", "hiding", "not who they say", "cover",
+)
+_DEFENSE_KEYWORDS = (
+    "trust", "innocent", "clear", "vouch", "defend", "they're fine",
+    "not mafia", "i believe", "back them",
+)
+_CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
+    "detective": ("detective", "investigated", "i investigated", "i checked", "came back"),
+    "doctor": ("doctor", "i saved", "i protected", "i healed", "saved them"),
+}
+
+_PROBE_TEMPLATES = [
+    "What's your actual read right now -- who are you watching?",
+    "You've been quiet. Who are you suspicious of and why?",
+    "Walk me through your thinking -- who do you think it is?",
+    "I keep coming back to something. What's your gut telling you?",
+    "Give me something concrete -- who are you actually looking at?",
+    "You haven't said much. What have you been picking up on?",
+]
+_CHALLENGE_DETECTIVE = [
+    "If you're really the detective, what exactly did you find?",
+    "Okay, detective claim -- who did you investigate, and what came back?",
+    "That's a bold claim. Give us the specifics.",
+    "Alright, detective -- who did you check last night and what was the result?",
+]
+_CHALLENGE_DOCTOR = [
+    "If you're the doctor, who did you protect last night?",
+    "Doctor claim -- okay, but can you tell us who you've been saving?",
+    "So who have you been protecting? I'd like the details.",
+    "Alright, if you're the doctor, what's your read on who needs protection tonight?",
+]
+_COVER_TEMPLATES = [
+    "I actually don't buy that {name} is mafia -- this feels like a rush to judgment.",
+    "Hold on. Everyone's piling on {name} but I haven't heard actual evidence.",
+    "I've been watching {name} and honestly I'm not seeing it. What's the actual case here?",
+    "Can we slow down on {name}? This feels like someone steering the room.",
+]
+_FRAME_TEMPLATES = [
+    "Something feels off about {name} -- too quiet, too convenient.",
+    "I keep coming back to {name}. What's everyone else's read?",
+    "Can {name} actually explain their reasoning? Their story keeps shifting.",
+    "{name} has been deflecting every time this comes up. That's a tell for me.",
+]
 
 
 class HeuristicAgent(Agent):
@@ -36,29 +88,55 @@ class HeuristicAgent(Agent):
 
         if view.role is Role.MAFIA:
             pool = [n for n in others if n not in view.teammates]
+            # Anyone who has publicly claimed detective is the single biggest threat
+            claims = self._claim_tracker(view)
+            detective_targets = [n for n in pool if claims.get(n) == "detective"]
+            if detective_targets:
+                return self._rng.choice(detective_targets)
+            # Follow teammate consensus from the night huddle
             consensus = self._teammate_kill_suggestions(view, pool)
             if consensus:
                 top = max(consensus.values())
                 return self._rng.choice([n for n, c in consensus.items() if c == top])
+            # Otherwise kill whoever has been most actively accusing / investigating
+            threat = self._threat_tally(view, pool)
+            if threat:
+                top = max(threat.values())
+                return self._rng.choice([n for n, c in threat.items() if c == top])
             return self._rng.choice(pool or others)
 
         if view.role is Role.DETECTIVE:
             unknown = [n for n in others if n not in view.known_factions]
             pool = unknown or others
-            suspicion = self._suspicion_tally(view)
-            ranked = sorted(pool, key=lambda n: suspicion.get(n, 0), reverse=True)
-            top_score = suspicion.get(ranked[0], 0)
-            return self._rng.choice([n for n in ranked if suspicion.get(n, 0) == top_score])
+            # Investigate whoever is under the most accusation pressure -- best chance of a hit
+            pressure = self._accusation_pressure(view)
+            ranked = sorted(pool, key=lambda n: pressure.get(n, 0), reverse=True)
+            top_score = pressure.get(ranked[0], 0)
+            return self._rng.choice([n for n in ranked if pressure.get(n, 0) == top_score])
 
         if view.role is Role.DOCTOR:
-            if others and self._rng.random() < 0.5:
-                return self._rng.choice(others)
-            return view.self_name
+            # Protect whoever the Mafia is most likely targeting tonight
+            claims = self._claim_tracker(view)
+            # A detective claimer is the highest-value Mafia target -- protect them
+            detective_claimers = [n for n in others if claims.get(n) == "detective"]
+            if detective_claimers:
+                return self._rng.choice(detective_claimers)
+            # Next best: protect whoever has been most vocally accusing people
+            # (they're a threat to Mafia, so Mafia wants them gone)
+            activity = self._accusation_activity(view, others)
+            if activity:
+                top = max(activity.values())
+                return self._rng.choice([n for n, c in activity.items() if c == top])
+            # Fall back to self if under heat, otherwise random
+            self_heat = self._accusation_pressure(view).get(view.self_name, 0)
+            if self_heat > 0 and self._rng.random() < 0.6:
+                return view.self_name
+            return self._rng.choice(others) if others else view.self_name
 
         raise AssertionError(f"{view.role} has no night action")
 
     def _teammate_kill_suggestions(self, view: AgentView, candidates: list[str]) -> Counter[str]:
-        """What did my fellow mafia float during tonight's huddle?"""
+        """Names floated by teammates during tonight's huddle."""
         mentions: Counter[str] = Counter()
         candidate_set = set(candidates)
         for sighting in view.feed:
@@ -88,6 +166,7 @@ class HeuristicAgent(Agent):
         if self._rng.random() > self._chattiness / (1 + said_so_far * 0.15):
             return None
 
+        # Detective with proof -> broadcast claim immediately
         if view.phase is Phase.DAY and view.role is Role.DETECTIVE and not self._claimed:
             mafia_found = [n for n in others if view.known_factions.get(n) is Faction.MAFIA]
             if mafia_found:
@@ -107,37 +186,103 @@ class HeuristicAgent(Agent):
         teammates_alive = [n for n in view.teammates if n in view.alive]
         non_mafia = [n for n in others if n not in view.teammates]
 
+        # Priority 1 (day only): Cover a teammate drawing heat -- looks town, protects the team
+        if view.phase is Phase.DAY:
+            pressure = self._accusation_pressure(view)
+            threatened = [n for n in teammates_alive if pressure.get(n, 0) >= 2]
+            if threatened and self._rng.random() < 0.65:
+                target = self._rng.choice(threatened)
+                if teammates_alive and self._rng.random() < 0.45:
+                    # Warn teammates privately first so they know to adjust
+                    cast = CastType.UNICAST if len(teammates_alive) == 1 else CastType.MULTICAST
+                    content = f"{target} is getting too much heat -- we need to redirect this somewhere else."
+                    return CommRequest(cast, tuple(teammates_alive), content)
+                # Publicly defend to blend in as a concerned townie
+                content = self._rng.choice(_COVER_TEMPLATES).format(name=target)
+                return CommRequest(CastType.BROADCAST, (), content)
+
+        # Priority 2: Coordinate with teammates -- align on kill target or cover story
         if teammates_alive and self._rng.random() < 0.4:
             target = self._rng.choice(non_mafia) if non_mafia else self._rng.choice(others)
             cast = CastType.UNICAST if len(teammates_alive) == 1 else CastType.MULTICAST
-            verb = "kill" if view.phase is Phase.NIGHT else "vote out"
-            content = f"Let's {verb} {target} -- they're the bigger threat to us."
+            verb = "eliminate" if view.phase is Phase.NIGHT else "vote out"
+            content = f"Let's {verb} {target} -- they're our biggest threat right now."
             return CommRequest(cast, tuple(teammates_alive), content)
 
-        if view.phase is Phase.DAY and non_mafia:
+        # Priority 3 (day only): Frame a townie with a question that sounds like town concern
+        if view.phase is Phase.DAY and non_mafia and self._rng.random() < 0.5:
             target = self._rng.choice(non_mafia)
-            content = f"Something feels off about {target} -- too quiet, too convenient. I'm suspicious of them."
+            content = self._rng.choice(_FRAME_TEMPLATES).format(name=target)
             return CommRequest(CastType.BROADCAST, (), content)
+
         return None
 
     def _town_turn(self, view: AgentView, others: list[str]) -> CommRequest | None:
-        suspicion = self._suspicion_tally(view)
-        ranked = sorted((n for n in others if suspicion.get(n, 0) > 0), key=lambda n: suspicion[n], reverse=True)
+        pressure = self._accusation_pressure(view)
+        claims = self._claim_tracker(view)
 
-        if ranked and self._rng.random() < 0.5:
-            target = ranked[0]
+        # Priority 1: Challenge a role claim from someone already under suspicion
+        # -- an unverified claim from a suspicious player is a tell worth pressing
+        suspicious_claimers = [
+            n for n, role_str in claims.items()
+            if n in others and pressure.get(n, 0) > 0
+        ]
+        if suspicious_claimers and self._rng.random() < 0.55:
+            target = self._rng.choice(suspicious_claimers)
+            role_str = claims[target]
+            templates = _CHALLENGE_DETECTIVE if role_str == "detective" else _CHALLENGE_DOCTOR
+            question = self._rng.choice(templates)
+            return CommRequest(CastType.BROADCAST, (), f"{target} -- {question}")
+
+        # Priority 2: Strong confidence on a suspect -> accuse publicly or build a coalition first
+        hard_suspects = [n for n in others if pressure.get(n, 0) >= 2]
+        if hard_suspects and self._rng.random() < 0.5:
+            target = self._rng.choice(hard_suspects)
+            if self._rng.random() < 0.45:
+                # Whisper to a confidant before going public -- test whether they agree
+                pool = [n for n in others if n != target]
+                if pool:
+                    confidant = self._rng.choice(pool)
+                    content = f"I'm pretty sure {target} is mafia. Are you seeing what I'm seeing?"
+                    return CommRequest(CastType.UNICAST, (confidant,), content)
+            content = f"I'm not letting this drop -- {target}'s story doesn't hold together and I'm voting for them."
+            return CommRequest(CastType.BROADCAST, (), content)
+
+        # Priority 3: Probe a player who hasn't spoken at all this phase
+        # -- silence in Mafia is a choice, and it's worth naming out loud
+        quiet = self._quiet_players(view, others)
+        if quiet and self._rng.random() < 0.45:
+            target = self._rng.choice(quiet)
+            question = self._rng.choice(_PROBE_TEMPLATES)
+            return CommRequest(CastType.UNICAST, (target,), f"{target}, {question}")
+
+        # Priority 4: Follow up on any unverified role claim -- even a non-suspicious one
+        # deserves a question so we have something on the record
+        unverified = [n for n in claims if n in others]
+        if unverified and self._rng.random() < 0.4:
+            target = self._rng.choice(unverified)
+            role_str = claims[target]
+            templates = _CHALLENGE_DETECTIVE if role_str == "detective" else _CHALLENGE_DOCTOR
+            question = self._rng.choice(templates)
+            return CommRequest(CastType.BROADCAST, (), f"Alright, {target} -- {question}")
+
+        # Priority 5: Moderate suspicion -> broadcast accusation
+        moderate_suspects = [n for n in others if pressure.get(n, 0) > 0]
+        if moderate_suspects and self._rng.random() < 0.5:
+            target = self._rng.choice(moderate_suspects)
             content = f"I think {target} is acting suspicious -- their story doesn't add up to me."
             return CommRequest(CastType.BROADCAST, (), content)
 
-        if len(others) >= 2 and self._rng.random() < 0.35:
-            confidant = self._rng.choice(others)
-            remaining = [n for n in others if n != confidant]
-            target = self._rng.choice(remaining or others)
-            content = f"Just between us -- I don't trust {target}. Keep an eye on them."
-            return CommRequest(CastType.UNICAST, (confidant,), content)
+        # Priority 6: Direct probe to gather information -- ask someone their read
+        # This is the fallback information-seeking move when there's nothing concrete yet
+        if self._rng.random() < 0.45:
+            target = self._rng.choice(others)
+            question = self._rng.choice(_PROBE_TEMPLATES)
+            return CommRequest(CastType.UNICAST, (target,), f"Hey -- {question}")
 
+        # Fallback: open question to the room
         target = self._rng.choice(others)
-        content = f"I don't have a strong read yet, but {target} has been quiet. What do you all think?"
+        content = f"I don't have a strong read yet. What does everyone think about {target}?"
         return CommRequest(CastType.BROADCAST, (), content)
 
     # ------------------------------------------------------------------
@@ -153,32 +298,77 @@ class HeuristicAgent(Agent):
             if mafia_known:
                 return self._rng.choice(mafia_known)
 
-        suspicion = self._suspicion_tally(view)
-        if view.faction is Faction.MAFIA:
-            town_targets = [n for n in others if n not in view.teammates]
-            pool = town_targets or others
-        else:
-            pool = others
+        pressure = self._accusation_pressure(view)
+        pool = [n for n in others if n not in view.teammates] if view.faction is Faction.MAFIA else others
 
-        ranked = sorted(pool, key=lambda n: suspicion.get(n, 0), reverse=True)
-        top_score = suspicion.get(ranked[0], 0)
+        ranked = sorted(pool, key=lambda n: pressure.get(n, 0), reverse=True)
+        top_score = pressure.get(ranked[0], 0)
         if top_score > 0:
-            return self._rng.choice([n for n in ranked if suspicion.get(n, 0) == top_score])
+            return self._rng.choice([n for n in ranked if pressure.get(n, 0) == top_score])
         return self._rng.choice(pool)
 
     # ------------------------------------------------------------------
-    # Reading the room: a live re-scan of the feed, not persisted state
+    # Feed analysis
     # ------------------------------------------------------------------
-    def _suspicion_tally(self, view: AgentView) -> Counter[str]:
+    def _accusation_pressure(self, view: AgentView) -> Counter[str]:
+        """How many accusatory messages have named each player."""
         tally: Counter[str] = Counter()
         names = set(view.alive) - {view.self_name}
         for sighting in view.feed:
             if not sighting.is_content_known or sighting.sender == view.self_name:
                 continue
             text = sighting.content.lower()
-            if not any(keyword in text for keyword in _SUSPICION_KEYWORDS):
+            if not any(kw in text for kw in _ACCUSATION_KEYWORDS):
                 continue
             for name in names:
                 if name != sighting.sender and name.lower() in text:
                     tally[name] += 1
         return tally
+
+    def _claim_tracker(self, view: AgentView) -> dict[str, str]:
+        """First detected role claim per player (detective or doctor), from the feed."""
+        claims: dict[str, str] = {}
+        for sighting in view.feed:
+            if not sighting.is_content_known or sighting.sender == view.self_name:
+                continue
+            if sighting.sender in claims:
+                continue
+            text = sighting.content.lower()
+            for role_str, patterns in _CLAIM_PATTERNS.items():
+                if any(p in text for p in patterns):
+                    claims[sighting.sender] = role_str
+                    break
+        return claims
+
+    def _threat_tally(self, view: AgentView, pool: list[str]) -> Counter[str]:
+        """How actively each player in pool has been accusing or investigating (Mafia kill priority)."""
+        tally: Counter[str] = Counter()
+        pool_set = set(pool)
+        threat_kw = _ACCUSATION_KEYWORDS + ("investigate", "detective", "found", "checking")
+        for sighting in view.feed:
+            if sighting.sender not in pool_set or not sighting.is_content_known:
+                continue
+            if any(kw in sighting.content.lower() for kw in threat_kw):
+                tally[sighting.sender] += 1
+        return tally
+
+    def _accusation_activity(self, view: AgentView, pool: list[str]) -> Counter[str]:
+        """How many accusatory messages each player in pool has sent (Doctor protection signal)."""
+        tally: Counter[str] = Counter()
+        pool_set = set(pool)
+        for sighting in view.feed:
+            if sighting.sender not in pool_set or not sighting.is_content_known:
+                continue
+            if any(kw in sighting.content.lower() for kw in _ACCUSATION_KEYWORDS):
+                tally[sighting.sender] += 1
+        return tally
+
+    def _quiet_players(self, view: AgentView, others: list[str]) -> list[str]:
+        """Players who have not spoken at all this phase -- silence is itself a signal."""
+        speakers = {
+            s.sender for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+            and s.is_content_known
+        }
+        return [n for n in others if n not in speakers]
