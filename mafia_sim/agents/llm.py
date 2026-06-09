@@ -6,8 +6,17 @@ this is a drop-in swap (and any future agent, on any stack, plugs in the same
 way). It reasons solely from its `AgentView`: a system prompt explains its
 identity, the rules, and the A2A protocol; a per-turn human prompt supplies
 the live situation -- who's alive, what it has personally perceived -- and
-the question at hand. Decisions are returned as structured Pydantic objects
-so they can be validated and mapped back onto the protocol's exact types.
+the question at hand.
+
+Each distinct game action is exposed as a **tool** the model can call, rather
+than a flat schema it must fill in.  Nine tools cover every action:
+
+  Night (role-specific):  _EliminateTool  _ProtectTool  _InvestigateTool
+  Vote:                   _VoteTool  _AbstainTool
+  Discussion:             _BroadcastTool  _WhisperTool  _HuddleTool  _PassTurnTool
+
+The model picks the right tool for its intent; `tool_choice="any"` forces a
+decision for night and vote; discussion is open (no call = stay silent).
 
 Requires `OPENAI_API_KEY` in the environment (langchain-openai reads it
 automatically).
@@ -16,7 +25,6 @@ automatically).
 from __future__ import annotations
 
 import random
-from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -46,29 +54,63 @@ _REASONING_FIELD = (
 )
 
 
-class _NightActionDecision(BaseModel):
-    target: str = Field(description="Exact name of the player you act on tonight")
+# ── Night-action tools (each role sees only the one that applies to them) ─────
+
+class _EliminateTool(BaseModel):
+    """[MAFIA] Commit to eliminating this player tonight."""
+    target: str = Field(description="Exact name of the player to eliminate")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _VoteDecision(BaseModel):
-    target: str | None = Field(default=None, description="Exact name of the player to lynch, or null to abstain")
+class _ProtectTool(BaseModel):
+    """[DOCTOR] Choose one player to shield from tonight's Mafia kill."""
+    target: str = Field(description="Exact name of the player to protect")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _DiscussionDecision(BaseModel):
-    speak: bool = Field(description="True to say something now, False to stay silent and pass this turn")
-    cast: Literal["unicast", "multicast", "broadcast"] = Field(
-        default="broadcast",
-        description="unicast = whisper to exactly one person, multicast = huddle with two or more, "
-                    "broadcast = address the whole room",
-    )
-    to: list[str] = Field(
-        default_factory=list,
-        description="Recipients by exact name: exactly one for unicast, two or more for multicast, "
-                    "empty for broadcast",
-    )
-    content: str = Field(default="", description="What you actually say -- short, in your character's voice (1-3 sentences). React to the moment; don't summarize it. Don't explain your reasoning; let the statement or question land on its own.")
+class _InvestigateTool(BaseModel):
+    """[DETECTIVE] Investigate one player and learn whether they are Town or Mafia."""
+    target: str = Field(description="Exact name of the player to investigate")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+# ── Vote tools ────────────────────────────────────────────────────────────────
+
+class _VoteTool(BaseModel):
+    """Cast your lynch vote for a specific player."""
+    target: str = Field(description="Exact name of the player you vote to lynch")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _AbstainTool(BaseModel):
+    """Pass on this vote -- contribute nothing to the tally."""
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+# ── Discussion tools ──────────────────────────────────────────────────────────
+
+class _BroadcastTool(BaseModel):
+    """Speak to everyone currently at the table."""
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _WhisperTool(BaseModel):
+    """Lean over and privately say something to exactly one person. Everyone else can see you whispered but not what you said."""
+    recipient: str = Field(description="Exact name of the single person you are whispering to")
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _HuddleTool(BaseModel):
+    """Pull two or more specific people into a private side conversation. Everyone else sees who huddled but not what was said."""
+    recipients: list[str] = Field(description="Exact names of 2 or more people in the huddle")
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _PassTurnTool(BaseModel):
+    """Stay silent this turn -- observe instead of committing to a message."""
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
@@ -279,9 +321,19 @@ class LLMAgent(Agent):
         # the same message (the 12-confirmation night-coordination problem).
         self._phase_transcript: dict[str, list[str]] = {}
         llm = ChatOpenAI(model=model, temperature=temperature)
-        self._night_brain = llm.with_structured_output(_NightActionDecision)
-        self._vote_brain = llm.with_structured_output(_VoteDecision)
-        self._discussion_brain = llm.with_structured_output(_DiscussionDecision)
+        # Each role sees only the single night-action tool that applies to them;
+        # tool_choice="any" forces the model to always call it.
+        self._night_llm: dict[Role, object] = {
+            Role.MAFIA:      llm.bind_tools([_EliminateTool],   tool_choice="any"),
+            Role.DOCTOR:     llm.bind_tools([_ProtectTool],     tool_choice="any"),
+            Role.DETECTIVE:  llm.bind_tools([_InvestigateTool], tool_choice="any"),
+        }
+        # Vote: must call exactly one of these two tools.
+        self._vote_llm = llm.bind_tools([_VoteTool, _AbstainTool], tool_choice="any")
+        # Discussion: model may call one tool or none (= stay silent).
+        self._discussion_llm = llm.bind_tools(
+            [_BroadcastTool, _WhisperTool, _HuddleTool, _PassTurnTool]
+        )
 
     # ------------------------------------------------------------------
     # Night
@@ -321,13 +373,16 @@ class LLMAgent(Agent):
         }[view.role]
 
         try:
-            decision = self._night_brain.invoke(self._messages(view, question))
+            response = self._night_llm[view.role].invoke(self._messages(view, question))
         except Exception as exc:
             self._warn(f"night-action call failed ({exc!r}); choosing at random")
             return self._rng.choice(candidates)
 
-        self._remember(view, decision.reasoning)
-        return self._match_name(decision.target, candidates) or self._rng.choice(candidates)
+        if not response.tool_calls:
+            return self._rng.choice(candidates)
+        tc = response.tool_calls[0]["args"]
+        self._remember(view, tc.get("reasoning", ""))
+        return self._match_name(tc.get("target", ""), candidates) or self._rng.choice(candidates)
 
     def _night_candidates(self, view: AgentView) -> list[str]:
         others = list(view.others_alive)
@@ -363,15 +418,18 @@ class LLMAgent(Agent):
             "but be honest about whether that's caution or avoidance."
         )
         try:
-            decision = self._vote_brain.invoke(self._messages(view, question))
+            response = self._vote_llm.invoke(self._messages(view, question))
         except Exception as exc:
             self._warn(f"vote call failed ({exc!r}); abstaining")
             return None
 
-        self._remember(view, decision.reasoning)
-        if decision.target is None:
+        if not response.tool_calls:
             return None
-        return self._match_name(decision.target, others)
+        tc = response.tool_calls[0]
+        self._remember(view, tc["args"].get("reasoning", ""))
+        if tc["name"] == "_AbstainTool":
+            return None
+        return self._match_name(tc["args"].get("target", ""), others)
 
     # ------------------------------------------------------------------
     # Discussion
@@ -422,24 +480,55 @@ class LLMAgent(Agent):
                 "purpose. If you'd rather observe this round, passing is also a real move."
             )
         try:
-            decision = self._discussion_brain.invoke(self._messages(view, question))
+            response = self._discussion_llm.invoke(self._messages(view, question))
         except Exception as exc:
             self._warn(f"discussion call failed ({exc!r}); staying silent")
             return None
 
-        self._remember(view, decision.reasoning)
-        if not decision.speak or not decision.content.strip():
+        if not response.tool_calls:
+            return None  # model chose not to act this turn
+
+        tc = response.tool_calls[0]
+        self._remember(view, tc["args"].get("reasoning", ""))
+
+        name = tc["name"]
+
+        if name == "_PassTurnTool":
             return None
 
-        try:
-            cast = CastType(decision.cast)
-        except ValueError:
-            cast = CastType.BROADCAST
-        if cast is CastType.MULTICAST and len(others) < 2:
-            cast = CastType.UNICAST
+        content = tc["args"].get("content", "").strip()
+        if not content:
+            return None
 
-        to = self._resolve_recipients(cast, decision.to, others)
-        content = decision.content.strip()
+        if name == "_BroadcastTool":
+            cast, to = CastType.BROADCAST, ()
+
+        elif name == "_WhisperTool":
+            recipient = self._match_name(tc["args"].get("recipient", ""), others)
+            if not recipient:
+                recipient = self._rng.choice(others)
+            cast, to = CastType.UNICAST, (recipient,)
+
+        elif name == "_HuddleTool":
+            raw = tc["args"].get("recipients", [])
+            matched: list[str] = []
+            for r in raw:
+                m = self._match_name(r, others)
+                if m and m not in matched:
+                    matched.append(m)
+            # Need at least 2 for a valid multicast; pad from remaining if short
+            if len(matched) < 2:
+                pool = [n for n in others if n not in matched]
+                self._rng.shuffle(pool)
+                matched.extend(pool[: 2 - len(matched)])
+            if len(matched) < 2:
+                cast, to = CastType.BROADCAST, ()
+            else:
+                cast, to = CastType.MULTICAST, tuple(matched)
+
+        else:
+            return None  # unknown tool -- stay silent
+
         phase_key = f"{view.day_number}:{view.phase.value}"
         self._phase_transcript.setdefault(phase_key, []).append(content)
         return CommRequest(cast, to, content)
@@ -465,26 +554,6 @@ class LLMAgent(Agent):
             if count >= 2:
                 return top
         return None
-
-    def _resolve_recipients(self, cast: CastType, raw_to: list[str], others: list[str]) -> tuple[str, ...]:
-        if cast is CastType.BROADCAST:
-            return ()
-
-        matched: list[str] = []
-        for raw in raw_to:
-            name = self._match_name(raw, others)
-            if name and name not in matched:
-                matched.append(name)
-
-        minimum = 1 if cast is CastType.UNICAST else 2
-        if len(matched) < minimum:
-            pool = [n for n in others if n not in matched]
-            self._rng.shuffle(pool)
-            matched.extend(pool[: minimum - len(matched)])
-
-        if cast is CastType.UNICAST:
-            return (matched[0],)
-        return tuple(matched)
 
     # ------------------------------------------------------------------
     # Prompt construction
