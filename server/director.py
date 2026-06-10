@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from mafia_sim import PERSONAS, Agent, LLMAgent, Simulation
+from mafia_sim import PERSONAS, Agent, CallBudget, LLMAgent, Simulation, stable_int_seed
 from mafia_sim.events import GameEvent
 
 from .hub import GameHub
@@ -34,7 +34,13 @@ PLAYER_NAMES = [
     "Frankie", "Harper", "Jordan", "Kai", "Logan",
 ]
 NUM_MAFIA = 2
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-4.1-mini"
+
+# Safety net against a pathological game racking up cost: once either limit
+# is hit, every agent falls back to cheap defaults for the rest of the game
+# (see CallBudget / LLMAgent).
+MAX_LLM_CALLS_PER_GAME = 400
+MAX_GAME_SECONDS = 1800  # 30 minutes
 
 # Sentinel placed on the bridge queue once the worker thread has nothing left to send.
 _DONE = object()
@@ -67,8 +73,15 @@ def _build_agents(seed: int) -> list[Agent]:
     different group of people from game to game (never repeats a seat -- ten
     players, fifteen personas, no two voices the same on a given night)."""
     personas = random.Random(seed).sample(PERSONAS, len(PLAYER_NAMES))
+    budget = CallBudget(MAX_LLM_CALLS_PER_GAME, MAX_GAME_SECONDS)
     return [
-        LLMAgent(name, model=MODEL, persona=persona, rng=random.Random(hash((name, seed)) & 0xFFFF))
+        LLMAgent(
+            name,
+            model=MODEL,
+            persona=persona,
+            rng=random.Random(stable_int_seed(name, seed)),
+            budget=budget,
+        )
         for name, persona in zip(PLAYER_NAMES, personas)
     ]
 

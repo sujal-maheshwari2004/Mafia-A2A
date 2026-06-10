@@ -19,15 +19,19 @@ import os
 from contextlib import asynccontextmanager, suppress
 from typing import Literal
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from .director import direct_games
-from .hub import ErrorUpdate, GameHub, StatusUpdate
+from .hub import DISCONNECT, ErrorUpdate, GameHub, StatusUpdate
 
 logger = logging.getLogger("mafia.server")
 
 hub = GameHub()
+
+# /game/roles is a deliberate spoiler -- disabled by default. Set
+# MAFIA_ROLES_TOKEN to enable it, gated behind a matching ?token= query param.
+_ROLES_TOKEN = os.environ.get("MAFIA_ROLES_TOKEN")
 
 
 @asynccontextmanager
@@ -73,7 +77,7 @@ def root() -> dict[str, str]:
 
 
 @app.get("/game/roles")
-def roles() -> dict[str, dict[str, str] | None]:
+def roles(token: str | None = None) -> dict[str, dict[str, str] | None]:
     """Reveal who is who at the table currently (or most recently) seated.
 
     The WebSocket stream only ever reveals a seat's role when the *table itself*
@@ -83,9 +87,17 @@ def roles() -> dict[str, dict[str, str] | None]:
     spectator UI that wants to offer one (a "reveal seats" toggle, a who's-who
     legend, face-down cards a viewer can choose to flip, ...).
 
+    Disabled (404) unless the `MAFIA_ROLES_TOKEN` env var is set, in which case
+    a matching `?token=` query param is required (403 otherwise) -- this is a
+    deliberate spoiler and shouldn't be reachable by an unauthenticated client.
+
     Returns `{"roles": {"Avery": "Mafia", ...}}`, or `{"roles": null}` before
     the very first table has ever been seated.
     """
+    if _ROLES_TOKEN is None:
+        raise HTTPException(status_code=404)
+    if token != _ROLES_TOKEN:
+        raise HTTPException(status_code=403)
     return {"roles": hub.roles}
 
 
@@ -128,6 +140,8 @@ async def stream_game(websocket: WebSocket) -> None:
 
         while True:
             item = await queue.get()
+            if item is DISCONNECT:
+                break
             if isinstance(item, StatusUpdate):
                 await websocket.send_json(_status_frame(item))
             elif isinstance(item, ErrorUpdate):

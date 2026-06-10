@@ -1,6 +1,7 @@
 """Mafia simulator: a reusable game engine, an A2A comm protocol, agents, and a CLI."""
 
 from .agents import Agent, AgentView, DeathRecord, HeuristicAgent, LLMAgent, PERSONAS
+from .budget import CallBudget
 from .events import (
     DayResolved,
     GameEnded,
@@ -15,10 +16,12 @@ from .protocol import CastType, CommBus, CommRequest, Message, ProtocolError, Si
 from .engine import GameEngine, IllegalActionError
 from .models import DayResult, Faction, NightResult, Phase, Player, Role
 from .simulation import Simulation
+from .util import stable_int_seed
 
 __all__ = [
     "Agent",
     "AgentView",
+    "CallBudget",
     "DeathRecord",
     "HeuristicAgent",
     "LLMAgent",
@@ -46,4 +49,5 @@ __all__ = [
     "Player",
     "Role",
     "Simulation",
+    "stable_int_seed",
 ]

@@ -27,7 +27,12 @@ class PhaseStarted(BaseModel):
     type: Literal["phase_started"] = "phase_started"
     phase: Literal["Night", "Day"]
     day_number: int
-    present: list[str]  # who is "in the room" -- able to send/perceive right now
+    # Who is "in the room" -- able to send/perceive right now. Populated for Day
+    # (the alive roster is already public); left empty for Night so spectators
+    # can't read the Mafia's identity straight off this field. `present_count`
+    # is always populated, even when `present` is hidden.
+    present: list[str]
+    present_count: int
 
 
 class TableTalk(BaseModel):
@@ -40,6 +45,10 @@ class TableTalk(BaseModel):
     content: str
     day_number: int
     phase: Literal["Night", "Day"]
+    # How many people could perceive this message (the audience for `cast`,
+    # not just `len(to)`) -- e.g. a 2-person Mafia night huddle vs. a
+    # full-table Day broadcast, even though both might be `cast="broadcast"`.
+    room_size: int
 
 
 class NightResolved(BaseModel):

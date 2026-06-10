@@ -13,13 +13,39 @@ one simulation at once.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, Union
+
+from pydantic import TypeAdapter
 
 from mafia_sim.events import GameEvent
 
+logger = logging.getLogger("mafia.hub")
+
 Mode = Literal["idle", "live", "replay"]
+
+_EVENT_ADAPTER = TypeAdapter(GameEvent)
+
+# Where the last completed game is persisted, so a restart can come back up
+# in "replay" mode instead of a blank "idle" until the next scheduled game.
+_DEFAULT_SAVE_PATH = Path(__file__).resolve().parent.parent / "data" / "last_game.json"
+
+# Cap on how far a subscriber can fall behind before it's dropped -- keeps a
+# stuck/slow consumer from growing its queue (and the hub's memory) without
+# bound. A fresh subscriber gets the backlog via `HubSnapshot.events`, not
+# this queue, so this only bounds *new* events arriving while connected.
+_QUEUE_MAXSIZE = 256
+
+
+class _Disconnected:
+    """Sentinel: this subscriber's queue overflowed and it has been dropped."""
+
+
+DISCONNECT = _Disconnected()
 
 
 @dataclass(frozen=True)
@@ -46,7 +72,7 @@ class HubSnapshot:
     next_game_at: datetime | None
 
 
-BroadcastItem = Union[GameEvent, StatusUpdate, ErrorUpdate]
+BroadcastItem = Union[GameEvent, StatusUpdate, ErrorUpdate, _Disconnected]
 
 
 class GameHub:
@@ -61,18 +87,20 @@ class GameHub:
     receive everything published after, with nothing skipped or duplicated.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, save_path: Path | None = None) -> None:
         self._events: list[GameEvent] = []
         self._mode: Mode = "idle"
         self._next_game_at: datetime | None = None
         self._subscribers: set[asyncio.Queue[BroadcastItem]] = set()
         self._roles: dict[str, str] | None = None
+        self._save_path = save_path or _DEFAULT_SAVE_PATH
+        self._load_from_disk()
 
     # ------------------------------------------------------------------
     # Subscriber lifecycle
     # ------------------------------------------------------------------
     def subscribe(self) -> tuple[HubSnapshot, "asyncio.Queue[BroadcastItem]"]:
-        queue: asyncio.Queue[BroadcastItem] = asyncio.Queue()
+        queue: asyncio.Queue[BroadcastItem] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
         snapshot = HubSnapshot(events=list(self._events), mode=self._mode, next_game_at=self._next_game_at)
         self._subscribers.add(queue)
         return snapshot, queue
@@ -93,8 +121,19 @@ class GameHub:
         return dict(self._roles) if self._roles is not None else None
 
     def _broadcast(self, item: BroadcastItem) -> None:
-        for queue in self._subscribers:
-            queue.put_nowait(item)
+        for queue in list(self._subscribers):
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                self._drop_subscriber(queue)
+
+    def _drop_subscriber(self, queue: "asyncio.Queue[BroadcastItem]") -> None:
+        """A subscriber that's fallen too far behind to catch up -- disconnect
+        it instead of blocking the hub or growing its queue without bound."""
+        self._subscribers.discard(queue)
+        while not queue.empty():
+            queue.get_nowait()
+        queue.put_nowait(DISCONNECT)
 
     def _broadcast_status(self) -> None:
         self._broadcast(StatusUpdate(mode=self._mode, next_game_at=self._next_game_at))
@@ -130,3 +169,33 @@ class GameHub:
         self._mode = "replay"
         self._next_game_at = next_game_at
         self._broadcast_status()
+        self._save_to_disk()
+
+    # ------------------------------------------------------------------
+    # Persistence -- survive a restart with the last completed game intact
+    # ------------------------------------------------------------------
+    def _load_from_disk(self) -> None:
+        try:
+            raw = json.loads(self._save_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return
+        try:
+            self._events = [_EVENT_ADAPTER.validate_python(e) for e in raw["events"]]
+            self._roles = raw.get("roles")
+        except Exception:
+            logger.warning("failed to load saved game from %s; ignoring", self._save_path, exc_info=True)
+            return
+        self._mode = "replay"
+
+    def _save_to_disk(self) -> None:
+        if not self._events:
+            return  # don't clobber a good "last game" file with an empty/errored run
+        try:
+            self._save_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "roles": self._roles,
+                "events": [event.model_dump(mode="json") for event in self._events],
+            }
+            self._save_path.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            logger.warning("failed to save game to %s", self._save_path, exc_info=True)

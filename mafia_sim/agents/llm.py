@@ -18,23 +18,40 @@ than a flat schema it must fill in.  Nine tools cover every action:
 The model picks the right tool for its intent; `tool_choice="any"` forces a
 decision for night and vote; discussion is open (no call = stay silent).
 
+Before each action, a separate cheap "table read" call (`_TableRead`, run on
+`_EXTRACTION_MODEL`) reads the conversation contextually -- who's actually
+under suspicion, who's been defended, role claims, contradictions, and (at
+night) whether the Mafia have converged on a kill target. This replaces
+keyword/substring scanning of the feed: it's the difference between matching
+the word "mafia" in "X is NOT mafia" and understanding that the sentence
+clears X.
+
 Requires `OPENAI_API_KEY` in the environment (langchain-openai reads it
 automatically).
 """
 
 from __future__ import annotations
 
+import difflib
 import random
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from ..protocol import CastType, CommRequest
-from ..models import Phase, Role
+from ..budget import CallBudget
+from ..protocol import CastType, CommRequest, Sighting
+from ..models import Faction, Phase, Role
 from .base import Agent, AgentView
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4.1-mini"
+
+# Used for the "table read" pass only -- a cheap, contextual reading of the
+# conversation (who's under suspicion, who's been defended, etc.) that replaces
+# keyword/substring scanning. Runs once per turn alongside the main call, so it
+# needs to be fast and inexpensive rather than the most capable model available.
+_EXTRACTION_MODEL = "gpt-4.1-nano"
 
 # How many of an agent's own past private notes get fed back into its next
 # prompt -- enough continuity to remember a running suspicion without letting
@@ -45,6 +62,13 @@ _MEMORY_LIMIT = 14
 # pattern-matching on a wall of near-identical messages in long games.
 _FEED_WINDOW = 25
 
+# Network defaults for every ChatOpenAI client below: a hung call must not be
+# allowed to block the worker thread (and the whole game) forever, but a
+# couple of quick retries absorb transient network blips before falling back
+# to the existing per-call fallbacks (random choice / silence).
+_REQUEST_TIMEOUT = 60  # seconds
+_MAX_RETRIES = 2
+
 _REASONING_FIELD = (
     "Your own private take on this moment -- who you suspect and why, what you're "
     "tracking, what you plan to do about it. Never shown to anyone else, but it IS "
@@ -52,6 +76,72 @@ _REASONING_FIELD = (
     "you'd actually want to be reminded of your own read later: specific, and honest "
     "about your suspicions, doubts, and hunches -- not a tidy summary for an audience."
 )
+
+
+# ── Table read: a contextual reading of the conversation, produced by a small ──
+# ── model, that replaces keyword/substring scanning of the feed. ──────────────
+
+class _PlayerNote(BaseModel):
+    name: str = Field(description="Exact player name")
+    note: str = Field(description="One short sentence: what's notable about them and why")
+
+
+class _TableRead(BaseModel):
+    """A contextual analysis of the table talk so far, in place of keyword matching."""
+
+    under_suspicion: list[_PlayerNote] = Field(
+        default_factory=list,
+        description=(
+            "Players currently under genuine suspicion based on what's actually been said, "
+            "and why. Do NOT include someone here if they were only mentioned while being "
+            "DEFENDED, cleared, or vouched for -- a sentence that clears someone is the "
+            "OPPOSITE of an accusation against them, even if it contains words like "
+            "'mafia' or 'suspicious'."
+        ),
+    )
+    defended: list[_PlayerNote] = Field(
+        default_factory=list,
+        description="Players who've been vouched for, defended, or cleared, and by whom.",
+    )
+    role_claims: list[_PlayerNote] = Field(
+        default_factory=list,
+        description=(
+            "Players who've claimed to be the Detective or Doctor, whether the claim has "
+            "been challenged, and whether it holds up under scrutiny."
+        ),
+    )
+    contradictions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific inconsistencies worth pointing out: a story that changed, a vote "
+            "that flipped without explanation, someone defending a player who later "
+            "looked guilty, etc. Empty list if nothing stands out."
+        ),
+    )
+    agreed_night_target: str | None = Field(
+        default=None,
+        description=(
+            "ONLY relevant for a Mafia night huddle: if the team has clearly converged on "
+            "who to eliminate tonight, name that player exactly. If there's no clear "
+            "agreement yet, or this isn't a Mafia night huddle, return null. A message "
+            "arguing AGAINST targeting someone does not count as agreement on that person."
+        ),
+    )
+
+
+# ── Day recap: a compact per-day digest, generated once a day has fully ───────
+# ── scrolled past, so early-game context survives long games. ─────────────────
+
+class _DaySummary(BaseModel):
+    """A compact private recap of one day, from one player's point of view."""
+
+    summary: str = Field(
+        description=(
+            "A compact 1-2 sentence private recap of this day, written for the player's "
+            "own future reference: key accusations or claims made, the lynch outcome, and "
+            "anything that still feels relevant going forward."
+        )
+    )
 
 
 # ── Night-action tools (each role sees only the one that applies to them) ─────
@@ -305,9 +395,14 @@ class LLMAgent(Agent):
         temperature: float = 0.85,
         rng: random.Random | None = None,
         persona: str | None = None,
+        budget: CallBudget | None = None,
     ):
         super().__init__(name)
         self._rng = rng or random.Random()
+        # Shared per-game ceiling on LLM activity -- once exhausted, every
+        # decision below falls back to its existing cheap default instead of
+        # calling the model at all.
+        self._budget = budget
         # How THIS seat carries itself -- one of `PERSONAS`, picked for them
         # before the game starts. Shapes voice and manner; never role or goals.
         self._persona = persona
@@ -320,7 +415,17 @@ class LLMAgent(Agent):
         # Injected back into every prompt so the model doesn't keep re-sending
         # the same message (the 12-confirmation night-coordination problem).
         self._phase_transcript: dict[str, list[str]] = {}
-        llm = ChatOpenAI(model=model, temperature=temperature)
+        # Keyed by "day:phase" -- who this agent has whispered/huddled with
+        # this phase, so it can be nudged to stop re-asking the same people
+        # the same thing.
+        self._probed_this_phase: dict[str, set[str]] = {}
+        # day_number -> compact recap, generated once that day is no longer
+        # "today" -- keeps early-game context alive without bloating the
+        # raw feed shown each turn.
+        self._day_summaries: dict[int, str] = {}
+        llm = ChatOpenAI(
+            model=model, temperature=temperature, timeout=_REQUEST_TIMEOUT, max_retries=_MAX_RETRIES
+        )
         # Each role sees only the single night-action tool that applies to them;
         # tool_choice="any" forces the model to always call it.
         self._night_llm: dict[Role, object] = {
@@ -334,12 +439,27 @@ class LLMAgent(Agent):
         self._discussion_llm = llm.bind_tools(
             [_BroadcastTool, _WhisperTool, _HuddleTool, _PassTurnTool]
         )
+        # Cheap, separate model for the "table read" -- a contextual pass over
+        # the conversation that replaces keyword/substring scanning. Temperature
+        # 0 because this is meant to be a faithful read, not a creative one.
+        self._table_read_llm = ChatOpenAI(
+            model=_EXTRACTION_MODEL, temperature=0, timeout=_REQUEST_TIMEOUT, max_retries=_MAX_RETRIES
+        ).with_structured_output(_TableRead)
+        # Same cheap model, bound for the once-per-day recap instead.
+        self._day_summary_llm = ChatOpenAI(
+            model=_EXTRACTION_MODEL, temperature=0, timeout=_REQUEST_TIMEOUT, max_retries=_MAX_RETRIES
+        ).with_structured_output(_DaySummary)
 
     # ------------------------------------------------------------------
     # Night
     # ------------------------------------------------------------------
     def choose_night_target(self, view: AgentView) -> str:
         candidates = self._night_candidates(view)
+        if self._budget is not None:
+            if self._budget.exhausted:
+                return self._rng.choice(candidates)
+            self._budget.record()
+        table_read = self._get_table_read(view)
         question = {
             Role.MAFIA: (
                 "Night falls. Who do you eliminate?\n"
@@ -373,7 +493,7 @@ class LLMAgent(Agent):
         }[view.role]
 
         try:
-            response = self._night_llm[view.role].invoke(self._messages(view, question))
+            response = self._night_llm[view.role].invoke(self._messages(view, question, table_read))
         except Exception as exc:
             self._warn(f"night-action call failed ({exc!r}); choosing at random")
             return self._rng.choice(candidates)
@@ -399,26 +519,29 @@ class LLMAgent(Agent):
         others = list(view.others_alive)
         if not others:
             return None
+        if self._budget is not None:
+            if self._budget.exhausted:
+                return None  # abstain
+            self._budget.record()
 
-        pressure_lines = self._today_accusation_summary(view, others)
-        pressure_str = (
-            "\n".join(f"  - {s}" for s in pressure_lines)
-            if pressure_lines
-            else "  (no clear accusation target from today's discussion)"
-        )
+        table_read = self._get_table_read(view)
+        if table_read.under_suspicion:
+            pressure_str = "\n".join(f"  - {p.name}: {p.note}" for p in table_read.under_suspicion)
+        else:
+            pressure_str = "  (no one stood out as a clear accusation target today)"
         question = (
-            f"Time to vote. Today's discussion named these players most often:\n{pressure_str}\n\n"
+            f"Time to vote. Here's a contextual read of today's discussion:\n{pressure_str}\n\n"
             "This is real signal -- the room built it over this whole day phase. "
-            "Don't throw it away. Vote for the player the discussion pointed at most strongly, "
-            "unless you have a specific reason to believe that momentum was manufactured.\n\n"
-            "That said, don't ONLY look at counts: Who has been deflecting instead of asking? "
+            "Don't throw it away. Vote for the player the discussion actually pointed at most "
+            "strongly, unless you have a specific reason to believe that momentum was manufactured.\n\n"
+            "That said, don't ONLY follow the read above: Who has been deflecting instead of asking? "
             "Who defended an accused player faster than the evidence warranted? "
             "Whose read keeps conveniently shifting? "
             "If you have no real signal at all, abstaining beats killing a townie -- "
             "but be honest about whether that's caution or avoidance."
         )
         try:
-            response = self._vote_llm.invoke(self._messages(view, question))
+            response = self._vote_llm.invoke(self._messages(view, question, table_read))
         except Exception as exc:
             self._warn(f"vote call failed ({exc!r}); abstaining")
             return None
@@ -442,10 +565,16 @@ class LLMAgent(Agent):
         others = [n for n in view.present if n != view.self_name]
         if not others:
             return None
+        if self._budget is not None:
+            if self._budget.exhausted:
+                return None  # stay silent
+            self._budget.record()
+
+        table_read = self._get_table_read(view)
 
         if view.phase is Phase.NIGHT:
             killable = [n for n in view.others_alive if n not in view.teammates]
-            agreed_target = self._agreed_kill_target(view, killable)
+            agreed_target = self._match_name(table_read.agreed_night_target, killable)
             if agreed_target:
                 question = (
                     f"Your team has already agreed to eliminate {agreed_target} tonight -- "
@@ -479,8 +608,22 @@ class LLMAgent(Agent):
                 "If you speak: keep it short, in your own voice, choose your channel on "
                 "purpose. If you'd rather observe this round, passing is also a real move."
             )
+            if view.role is Role.DETECTIVE:
+                unclaimed = [
+                    name for name, faction in view.known_factions.items()
+                    if faction is Faction.MAFIA and not self._has_claimed(name)
+                ]
+                if unclaimed:
+                    question = (
+                        f"URGENT -- you privately know that {', '.join(unclaimed)} is Mafia, "
+                        "and the Town doesn't know it yet. Every phase you stay quiet is a "
+                        "phase the Mafia gets to operate freely, and if you're killed tonight "
+                        "this evidence dies with you. Seriously weigh claiming Detective and "
+                        "naming what you found against the risk of becoming tonight's target "
+                        "for staying silent.\n\n"
+                    ) + question
         try:
-            response = self._discussion_llm.invoke(self._messages(view, question))
+            response = self._discussion_llm.invoke(self._messages(view, question, table_read))
         except Exception as exc:
             self._warn(f"discussion call failed ({exc!r}); staying silent")
             return None
@@ -530,38 +673,22 @@ class LLMAgent(Agent):
             return None  # unknown tool -- stay silent
 
         phase_key = f"{view.day_number}:{view.phase.value}"
+        if self._is_repeat(content, self._phase_transcript.get(phase_key, [])):
+            return None  # near-duplicate of something already said this phase -- stay silent
+
+        if cast is not CastType.BROADCAST:
+            self._probed_this_phase.setdefault(phase_key, set()).update(to)
+
         self._phase_transcript.setdefault(phase_key, []).append(content)
         return CommRequest(cast, to, content)
-
-    def _agreed_kill_target(self, view: AgentView, killable: list[str]) -> str | None:
-        """Return a target name if teammates (incl. self) have mentioned the same name ≥2 times
-        in tonight's huddle -- meaning the kill is already agreed and doesn't need re-confirming."""
-        from collections import Counter as _Counter
-        mentions: _Counter[str] = _Counter()
-        for sighting in view.feed:
-            if not sighting.is_content_known:
-                continue
-            if sighting.day_number != view.day_number or sighting.phase_label != Phase.NIGHT.value:
-                continue
-            if sighting.sender not in view.teammates and sighting.sender != view.self_name:
-                continue
-            text = sighting.content.lower()
-            for name in killable:
-                if name.lower() in text:
-                    mentions[name] += 1
-        if mentions:
-            top, count = mentions.most_common(1)[0]
-            if count >= 2:
-                return top
-        return None
 
     # ------------------------------------------------------------------
     # Prompt construction
     # ------------------------------------------------------------------
-    def _messages(self, view: AgentView, question: str) -> list:
+    def _messages(self, view: AgentView, question: str, table_read: _TableRead) -> list:
         return [
             SystemMessage(content=self._system_prompt(view)),
-            HumanMessage(content=self._situation(view, question)),
+            HumanMessage(content=self._situation(view, question, table_read)),
         ]
 
     def _system_prompt(self, view: AgentView) -> str:
@@ -595,7 +722,8 @@ class LLMAgent(Agent):
         ]
         return "\n".join(lines)
 
-    def _situation(self, view: AgentView, question: str) -> str:
+    def _situation(self, view: AgentView, question: str, table_read: _TableRead) -> str:
+        self._ensure_day_summaries(view)
         lines = [
             f"Day {view.day_number} -- {view.phase.value} phase.",
             f"Still at the table, breathing: {', '.join(view.alive)}.",
@@ -632,6 +760,19 @@ class LLMAgent(Agent):
             known = ", ".join(f"{name} is {faction.value}" for name, faction in view.known_factions.items())
             lines.append(f"What you privately know, and only you know: {known}.")
 
+        if view.vote_history:
+            lines.append("")
+            lines.append("Lynch vote history:")
+            for day, votes in sorted(view.vote_history.items()):
+                if not votes:
+                    continue
+                cast_strs = [
+                    f"{voter} -> {target}" if target else f"{voter} -> abstain"
+                    for voter, target in votes.items()
+                ]
+                suffix = " (so far)" if day == view.day_number and view.phase is Phase.DAY else ""
+                lines.append(f"  Day {day}{suffix}: " + ", ".join(cast_strs))
+
         huddles = self._active_huddles(view)
         if huddles:
             lines.append("")
@@ -639,11 +780,28 @@ class LLMAgent(Agent):
             lines.append("the words, but no one slips off with someone else unnoticed at this table:")
             lines.extend(f"  - {' and '.join(group)} are off in their own exchange" for group in huddles)
 
-        signals = self._extract_signals(view)
-        if signals:
+        if (
+            table_read.under_suspicion
+            or table_read.defended
+            or table_read.role_claims
+            or table_read.contradictions
+        ):
             lines.append("")
-            lines.append("Intelligence signals -- patterns worth acting on, pre-parsed from the conversation:")
-            lines.extend(f"  - {s}" for s in signals)
+            lines.append("Table read -- a contextual reading of the conversation so far:")
+            for p in table_read.under_suspicion:
+                lines.append(f"  - SUSPICION: {p.name} -- {p.note}")
+            for p in table_read.defended:
+                lines.append(f"  - DEFENDED: {p.name} -- {p.note}")
+            for p in table_read.role_claims:
+                lines.append(f"  - ROLE CLAIM: {p.name} -- {p.note}")
+            for c in table_read.contradictions:
+                lines.append(f"  - CONTRADICTION: {c}")
+
+        if view.phase is Phase.DAY:
+            silent = self._silent_players(view)
+            if silent:
+                lines.append("")
+                lines.append(f"Has not said a word this phase: {', '.join(silent)}")
 
         if self._memory:
             lines.append("")
@@ -664,9 +822,25 @@ class LLMAgent(Agent):
             )
             lines.extend(f"  - \"{msg}\"" for msg in own_msgs[-6:])
 
+        probed = self._probed_this_phase.get(phase_key)
+        if probed:
+            lines.append("")
+            lines.append(
+                f"You've already pulled these people aside privately this phase: "
+                f"{', '.join(sorted(probed))}. Repeating the same question to them will feel "
+                "robotic -- bring something new, wait for their answer, or turn your "
+                "attention to someone else."
+            )
+
+        earlier_days = {day: summary for day, summary in sorted(self._day_summaries.items()) if summary}
+        if earlier_days:
+            lines.append("")
+            lines.append("Earlier days, in brief (the full transcript has scrolled past):")
+            lines.extend(f"  Day {day}: {summary}" for day, summary in earlier_days.items())
+
         lines.append("")
-        lines.append("The conversation so far, exactly as you've experienced it:")
-        feed = list(view.feed)
+        lines.append("Today's conversation so far, exactly as you've experienced it:")
+        feed = [s for s in view.feed if s.day_number == view.day_number]
         if len(feed) > _FEED_WINDOW:
             lines.append(f"  ... ({len(feed) - _FEED_WINDOW} earlier messages omitted) ...")
             feed = feed[-_FEED_WINDOW:]
@@ -678,94 +852,104 @@ class LLMAgent(Agent):
         lines += ["", question]
         return "\n".join(lines)
 
-    def _today_accusation_summary(self, view: AgentView, others: list[str]) -> list[str]:
-        """How many times each live player was named accusatorily in today's discussion."""
-        from collections import Counter as _Counter
-        _ACC_KW = (
-            "suspicious", "suspect", "mafia", "accuse", "vote out", "voting",
-            "lying", "liar", "hiding", "not who they say", "cover",
-        )
-        tally: _Counter[str] = _Counter()
-        alive_set = set(others)
-        for sighting in view.feed:
-            if not sighting.is_content_known:
-                continue
-            if sighting.day_number != view.day_number or sighting.phase_label != Phase.DAY.value:
-                continue
-            text = sighting.content.lower()
-            if not any(kw in text for kw in _ACC_KW):
-                continue
-            for name in alive_set:
-                if name.lower() in text and name != sighting.sender:
-                    tally[name] += 1
-        return [
-            f"{name} -- accused {count} time{'s' if count != 1 else ''} in today's discussion"
-            for name, count in tally.most_common(5)
-            if count > 0
-        ]
+    def _silent_players(self, view: AgentView) -> list[str]:
+        """Players present this phase who haven't sent anything you could perceive yet.
 
-    def _extract_signals(self, view: AgentView) -> list[str]:
-        """Pre-parsed intelligence signals the agent can act on right now.
-
-        The raw feed carries all of this in principle, but surfacing it as a
-        short labelled list means the model doesn't have to re-derive the same
-        patterns each turn -- and is more likely to actually use them.
+        Purely structural -- based on who has a sighting in this phase, not on
+        what anyone said -- so it stays accurate regardless of phrasing.
         """
-        _CLAIM_MARKERS: dict[str, tuple[str, ...]] = {
-            "Detective": ("detective", "i investigated", "i checked", "came back"),
-            "Doctor": ("doctor", "i saved", "i protected", "i healed"),
-        }
-        _DEFENSE_MARKERS = ("i trust", "is innocent", "not mafia", "vouch", "i believe", "i'll back", "backing")
-
-        claims: dict[str, str] = {}
-        defenders: dict[str, list[str]] = {}
         speakers: set[str] = set()
-        alive_names = set(view.alive) - {view.self_name}
-
         for sighting in view.feed:
-            if not sighting.is_content_known:
-                continue
-            sender = sighting.sender
-            text = sighting.content.lower()
-            # Role claims
-            if sender != view.self_name and sender not in claims:
-                for role_str, markers in _CLAIM_MARKERS.items():
-                    if any(m in text for m in markers):
-                        claims[sender] = role_str
-                        break
-            # Defenders: someone vouching for another by name
-            if any(m in text for m in _DEFENSE_MARKERS):
-                for name in alive_names:
-                    if name.lower() in text and name != sender:
-                        defenders.setdefault(name, [])
-                        if sender not in defenders[name]:
-                            defenders[name].append(sender)
-            # Track who has spoken this phase
             if sighting.day_number == view.day_number and sighting.phase_label == view.phase.value:
-                speakers.add(sender)
+                speakers.add(sighting.sender)
+        present_others = [n for n in view.present if n != view.self_name]
+        return [n for n in present_others if n not in speakers]
 
-        signals: list[str] = []
+    def _get_table_read(self, view: AgentView) -> _TableRead:
+        """A cheap, contextual read of the conversation so far -- replaces keyword scanning."""
+        if not view.feed:
+            return _TableRead()
+        try:
+            result = self._table_read_llm.invoke(self._table_read_prompt(view))
+        except Exception as exc:
+            self._warn(f"table-read call failed ({exc!r}); skipping contextual signals")
+            return _TableRead()
+        return result if isinstance(result, _TableRead) else _TableRead()
 
-        # Role claims + who's backed them
-        for claimant, role_str in claims.items():
-            backed_by = defenders.get(claimant, [])
-            note = f"backed by {', '.join(backed_by)}" if backed_by else "no one has challenged or confirmed this"
-            signals.append(f"{claimant} has claimed {role_str} ({note})")
+    def _table_read_prompt(self, view: AgentView) -> list:
+        lines = [
+            "You are an impartial observer analyzing the table talk in a game of Mafia (Werewolf), "
+            f"from the point of view of what the player {view.self_name} has personally seen or heard.",
+            f"Players still at the table: {', '.join(view.alive)}.",
+        ]
+        if view.phase is Phase.NIGHT and view.teammates:
+            lines.append(
+                f"This is a private Mafia night huddle. {view.self_name}'s fellow Mafia: "
+                f"{', '.join(view.teammates)}."
+            )
+        lines.append("")
+        lines.append("Conversation, oldest first:")
+        feed = list(view.feed)
+        if len(feed) > _FEED_WINDOW:
+            feed = feed[-_FEED_WINDOW:]
+        if feed:
+            lines.extend(f"  {sighting.render()}" for sighting in feed)
+        else:
+            lines.append("  (nothing yet)")
+        lines.append("")
+        lines.append(
+            "Read this carefully and report what's ACTUALLY going on -- not which words were used. "
+            "A sentence that defends, clears, or vouches for someone is the OPPOSITE of an "
+            "accusation against them, even if it contains words like 'suspicious' or 'mafia'. "
+            "Only report a Mafia night-kill agreement if the team has clearly converged on one "
+            "name; arguing against a name is not agreement on it."
+        )
+        return [HumanMessage(content="\n".join(lines))]
 
-        # Players who've been publicly vouched for (not just claimants)
-        for defended, defends in defenders.items():
-            if defended not in claims and len(defends) >= 1:
-                who = ", ".join(defends)
-                signals.append(f"{who} {'has' if len(defends) == 1 else 'have'} been publicly backing {defended}")
+    def _ensure_day_summaries(self, view: AgentView) -> None:
+        """Generate and cache a recap for any day that's no longer "today".
 
-        # Silent players this phase (day only -- night silence is expected for sleepers)
-        if view.phase is Phase.DAY:
-            present_others = [n for n in view.present if n != view.self_name]
-            silent = [n for n in present_others if n not in speakers]
-            if silent:
-                signals.append(f"Has not said a word this phase: {', '.join(silent)}")
+        Called every turn but cheap after the first call for a given day:
+        once `self._day_summaries[day]` is set (even to `""`, for a quiet
+        day with nothing perceived), it's never recomputed.
+        """
+        by_day: dict[int, list[Sighting]] = {}
+        for sighting in view.feed:
+            if sighting.day_number < view.day_number:
+                by_day.setdefault(sighting.day_number, []).append(sighting)
+        for day, sightings in by_day.items():
+            if day not in self._day_summaries:
+                self._day_summaries[day] = self._summarize_day(view, day, sightings)
 
-        return signals
+    def _summarize_day(self, view: AgentView, day: int, sightings: list[Sighting]) -> str:
+        """A compact 1-2 sentence recap of `day`, from `view.self_name`'s point of view."""
+        lines = [
+            f"You are recapping Day {day} of a game of Mafia (Werewolf) from "
+            f"{view.self_name}'s point of view, for their own future reference -- the "
+            "detailed transcript is about to scroll out of view.",
+            "",
+            "What they personally perceived that day:",
+        ]
+        lines.extend(f"  {sighting.render()}" for sighting in sightings)
+        votes = view.vote_history.get(day)
+        if votes:
+            cast_strs = [
+                f"{voter} -> {target}" if target else f"{voter} -> abstain"
+                for voter, target in votes.items()
+            ]
+            lines.append("")
+            lines.append(f"Lynch votes that day: {', '.join(cast_strs)}")
+        lines.append("")
+        lines.append(
+            "Write a compact 1-2 sentence private recap: key accusations or claims made, "
+            "the lynch outcome, and anything that still feels relevant going forward."
+        )
+        try:
+            result = self._day_summary_llm.invoke([HumanMessage(content="\n".join(lines))])
+        except Exception as exc:
+            self._warn(f"day-summary call failed ({exc!r}); skipping")
+            return ""
+        return result.summary.strip() if isinstance(result, _DaySummary) else ""
 
     def _active_huddles(self, view: AgentView) -> list[tuple[str, ...]]:
         """Side conversations visibly underway right now, as the room would see them.
@@ -809,16 +993,59 @@ class LLMAgent(Agent):
 
     # ------------------------------------------------------------------
     @staticmethod
+    def _is_repeat(content: str, recent: list[str], threshold: float = 0.82) -> bool:
+        """Is `content` a near-duplicate of something already said this phase?
+
+        Catches rephrasings the model might slip past its own "don't repeat
+        yourself" instruction -- e.g. asking the same person the same
+        question with slightly different wording.
+        """
+        lowered = content.lower()
+        return any(
+            difflib.SequenceMatcher(None, lowered, prev.lower()).ratio() >= threshold
+            for prev in recent
+        )
+
+    def _has_claimed(self, name: str) -> bool:
+        """Has this agent ever publicly named `name` in something it said?
+
+        A cheap proxy for "have I already raised this" -- used to avoid
+        nagging a Detective who's already started pointing at their suspect.
+        """
+        lowered = name.lower()
+        return any(
+            lowered in msg.lower()
+            for msgs in self._phase_transcript.values()
+            for msg in msgs
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
     def _match_name(raw: str | None, candidates: list[str]) -> str | None:
+        """Resolve a model-supplied name to one of `candidates`.
+
+        Exact match first, then a word-boundary match (handles trailing
+        punctuation or a name embedded in a longer phrase like "Drew did
+        it"), then a thresholded fuzzy match (handles minor typos). Never
+        falls back to a raw substring check -- that would let a short name
+        like "Kai" match "Kaiden" or vice versa.
+        """
         if not raw:
             return None
         cleaned = raw.strip().lower()
-        for name in candidates:
-            if name.lower() == cleaned:
+        lowered = {name.lower(): name for name in candidates}
+
+        if cleaned in lowered:
+            return lowered[cleaned]
+
+        for lower_name, name in lowered.items():
+            if re.search(rf"\b{re.escape(lower_name)}\b", cleaned):
                 return name
-        for name in candidates:
-            if name.lower() in cleaned or cleaned in name.lower():
-                return name
+
+        close = difflib.get_close_matches(cleaned, lowered.keys(), n=1, cutoff=0.8)
+        if close:
+            return lowered[close[0]]
+
         return None
 
     def _warn(self, message: str) -> None:

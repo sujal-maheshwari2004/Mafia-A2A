@@ -43,6 +43,7 @@ class AgentView:
     teammates: tuple[str, ...]              # fellow mafia, if you are one
     known_factions: dict[str, Faction]      # learned via investigation, etc.
     feed: tuple[Sighting, ...]              # your personal A2A perception history
+    vote_history: dict[int, dict[str, str | None]]  # day_number -> {voter: target_or_None}
 
     @property
     def others_alive(self) -> tuple[str, ...]:

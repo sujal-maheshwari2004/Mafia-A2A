@@ -1,0 +1,3587 @@
+Directory structure:
+└── Mafia-A2A/
+    ├── README.md
+    ├── Dockerfile
+    ├── main.py
+    ├── requirements.txt
+    ├── run_server.py
+    ├── spectate.py
+    ├── .dockerignore
+    ├── mafia_sim/
+    │   ├── __init__.py
+    │   ├── cli.py
+    │   ├── engine.py
+    │   ├── events.py
+    │   ├── models.py
+    │   ├── simulation.py
+    │   ├── agents/
+    │   │   ├── __init__.py
+    │   │   ├── base.py
+    │   │   ├── heuristic.py
+    │   │   └── llm.py
+    │   └── protocol/
+    │       ├── __init__.py
+    │       ├── bus.py
+    │       ├── casting.py
+    │       └── messages.py
+    └── server/
+        ├── __init__.py
+        ├── app.py
+        ├── director.py
+        └── hub.py
+
+================================================
+FILE: README.md
+================================================
+# Mafia Simulator
+
+A Mafia (a.k.a. Werewolf) engine, a custom agent-to-agent communication
+protocol, pluggable AI players, and a live streaming server -- built up in
+layers so each piece can be used on its own or wired into the next.
+
+```
+mafia_sim/
+â”œâ”€â”€ models.py       # Faction, Role, Player, Phase, NightResult, DayResult
+â”œâ”€â”€ engine.py       # GameEngine -- pure rules, no I/O
+â”œâ”€â”€ protocol/       # the A2A comm protocol (see below)
+â”œâ”€â”€ agents/         # the pluggable Agent interface + heuristic and LLM agents
+â”œâ”€â”€ events.py       # GameEvent types -- the streaming wire format
+â”œâ”€â”€ simulation.py   # Simulation -- plays a full agent-vs-agent game, yields events
+â””â”€â”€ cli.py          # human-playable text driver
+
+server/             # FastAPI app that streams a live game over a WebSocket
+main.py             # play one game yourself on the CLI
+spectate.py         # watch agents play each other, narrated to the console
+run_server.py       # serve games to a frontend over WebSocket
+```
+
+## Quick start
+
+```bash
+pip install fastapi uvicorn[standard] langchain-openai pydantic
+```
+
+**Play a game yourself** (you take one seat, bots fill the rest):
+
+```bash
+python main.py
+```
+
+**Watch AI agents play each other**, narrated to your terminal:
+
+```bash
+python spectate.py                       # 7 rule-based agents, random seed
+python spectate.py 8 42                  # 8 players, fixed seed (reproducible)
+python spectate.py 6 --brain llm         # LLM-backed agents (needs OPENAI_API_KEY)
+python spectate.py 8 --brain mixed       # half LLM, half heuristic -- compare them directly
+```
+
+**Stream a game to a frontend:**
+
+```bash
+python run_server.py                     # serves on ws://127.0.0.1:8000/ws/game
+```
+
+## The game
+
+Classic five-role Mafia: **Mafia**, **Doctor**, **Detective**, **Villager**.
+Night phase (Mafia secretly choose a kill, Doctor protects, Detective
+investigates) alternates with Day phase (open discussion, then a lynch vote),
+until either the Town eliminates every Mafia or the Mafia equal or outnumber
+the Town.
+
+`engine.py` is pure game logic -- no `print`/`input` anywhere. It exposes
+`start()`, `submit_night_action`/`resolve_night()`,
+`submit_vote`/`resolve_day()`, win-condition checks, and a narrative `log`,
+so a CLI, a test suite, or a server can all drive the exact same rules.
+
+## The A2A protocol (`mafia_sim/protocol/`)
+
+Agents don't just pick targets and votes -- they *talk*, the way people
+actually do at a table, through a custom **agent-to-agent (A2A) protocol**
+that is completely agent-agnostic (it knows nothing about roles, factions, or
+who -- human or AI -- is behind a seat):
+
+- **Three cast types**, freely chosen each time a player speaks:
+  - `broadcast` -- address the whole room
+  - `multicast` -- huddle with two or more specific people
+  - `unicast` -- privately whisper to exactly one person
+- **Capability mirrors presence**: at night, only the Mafia are "awake" and
+  able to send or perceive anything at all; during the day, everyone still
+  at the table can freely broadcast, huddle, or whisper.
+- **Dual-layer visibility**: the omniscient *spectator log* (`CommBus.spectator_log`)
+  records every message in full. Each agent's personal *feed*
+  (`CommBus.feed_for(name)`) instead holds `Sighting`s -- full content if they
+  were sender or recipient, but only the message's *shape* (who, what kind of
+  cast, to whom) if they merely witnessed it pass between others. Choosing a
+  private channel is therefore itself a visible, suspicion-fuelling move --
+  exactly like being noticed leaning in to whisper at a real table.
+- **Pacing** is a single global, monotonically increasing sequence number
+  stamped at submission time -- the entire "queue". Ordering only matters
+  where two messages land in the same inbox; everywhere else it costs nothing.
+
+`CommBus.send(sender, request, *, present, day_number, phase_label)` is the
+one place that turns a raw `CommRequest` into a routed `Message` (spectator
+record) plus per-agent `Sighting`s, validating presence and recipients and
+raising `ProtocolError` on any violation.
+
+## Agents (`mafia_sim/agents/`)
+
+Every seat is filled by something implementing the `Agent` ABC
+(`choose_night_target`, `choose_vote`, `discussion_turn`), reasoning solely
+from a read-only `AgentView` snapshot -- its own role/faction, who's alive,
+what it has privately learned, and its personal A2A feed. Neither the
+protocol nor the orchestrator (`Simulation`) ever know which kind of agent is
+behind a seat, so they're fully interchangeable:
+
+- **`HeuristicAgent`** -- rule-based, no API key required. Re-scans its feed
+  live each turn for a keyword-driven "suspicion tally," coordinates Mafia
+  kills by reading its teammates' night chatter, and produces templated
+  accusations/whispers/claims across all three cast types.
+- **`LLMAgent`** -- backed by **LangChain + OpenAI** (`ChatOpenAI(...).with_structured_output(...)`).
+  A system prompt explains its identity, role, and the A2A protocol; a
+  per-turn prompt supplies the live situation and its personal feed
+  (rendered via `Sighting.render()`). Decisions come back as validated
+  Pydantic objects, then get matched/repaired against the actual valid
+  candidates (`_match_name`, `_resolve_recipients`) before ever reaching the
+  bus, so a hallucinated name or malformed cast can never produce an illegal
+  message. Requires `OPENAI_API_KEY` in the environment.
+
+Mix and match freely -- `spectate.py --brain mixed` seats half of each so you
+can compare them in the same game.
+
+## Streaming events (`mafia_sim/events.py` + `simulation.py`)
+
+`Simulation.run()` is a generator that **yields `GameEvent`s** instead of
+printing -- it performs no I/O of its own, so the exact same simulation can
+drive a console spectator, a test, or a live WebSocket. Every event is a
+JSON-serializable Pydantic model with a literal `type` tag:
+
+| `type`            | carries |
+|-------------------|---------|
+| `game_started`    | the seated roster |
+| `phase_started`   | `Night`/`Day`, day number, who's present |
+| `table_talk`      | one A2A message -- seq, sender, cast, recipients, content |
+| `night_resolved`  | who (if anyone) died, whether the doctor's save worked |
+| `vote_cast`       | one lynch vote landing live -- voter, target, the running tally so far |
+| `day_resolved`    | who (if anyone) was lynched and their revealed role, vote tally, tie |
+| `game_ended`      | the winning faction and everyone's final role |
+
+Events are deliberately **structured rather than narrated** -- a frontend
+decides *how* to say "Avery was lynched, and they were the Detective"
+(copy, language, animation), not the backend. `spectate.py`'s `render_event`
+is one example consumer; a React UI is another, fed the identical stream.
+
+## Live streaming server (`server/`)
+
+`server/app.py` is a small FastAPI app that streams *the one shared game*
+over a single WebSocket endpoint, `/ws/game`. There's nothing to configure
+and nothing to wait for:
+
+- A fresh table of ten LLM-backed agents sits down **every hour, on the
+  hour** (`server/director.py`'s `direct_games` loop) -- there is never more
+  than one `Simulation` running on the server at a time.
+- Every connection just subscribes to that one game's broadcast
+  (`server/hub.py`'s `GameHub`). Connect any time and you're caught up
+  *instantly*: mid-game, you get everything that's happened so far followed
+  by the rest live; between games, you get the last completed game's full
+  transcript followed by live coverage of the next one the moment it starts.
+
+Connect and frames start flowing immediately -- no config message. The first
+frame is always a status frame:
+
+```json
+{"type": "status", "mode": "live" | "replay" | "idle", "next_game_at": "2024-01-01T15:00:00Z" | null}
+```
+
+- `"live"` -- a game is in progress; what follows catches you up on it, then
+  continues live.
+- `"replay"` -- the table's empty right now; what follows is the last
+  completed game's full transcript, then live coverage of the next one once
+  `next_game_at` arrives.
+- `"idle"` -- the very first game hasn't started yet; just wait for
+  `next_game_at`.
+
+After that, every frame is the `model_dump(mode="json")` of one `GameEvent`
+from `mafia_sim.events` (`game_started`, `phase_started`, `table_talk`,
+`night_resolved`, `vote_cast`, `day_resolved`, `game_ended`), in the exact
+order the game produced them -- interleaved with further `status` frames
+whenever the schedule changes, and `{"type": "error", "message": "..."}` if a
+game hits trouble mid-stream. The connection stays open across games, so a
+viewer can simply leave it running; disconnect whenever you like.
+
+Voting itself is streamed live, not just as a final headline: each `vote_cast`
+frame carries one player's vote (or abstention) plus the running tally the
+instant after it lands, in casting order -- everything a frontend needs to
+animate the count actually building (bars climbing, a leader emerging, a late
+swing) rather than only being able to show the result once `day_resolved`
+arrives with the final tally.
+
+### Who is who: `GET /game/roles`
+
+The WebSocket only ever reveals a seat's role when the *table itself* learns
+it -- a lynch unmasks the victim, `game_ended` unmasks everyone, exactly as a
+real game would. `GET /game/roles` is the deliberate exception: a plain JSON
+endpoint, `{"roles": {"Avery": "Mafia", ...}}`, that reveals the truth behind
+every seat at the currently- (or most recently-) seated table the moment it
+sits down -- a peek behind the curtain for a spectator UI that wants to offer
+one (a "reveal seats" toggle, a who's-who legend, face-down cards a viewer can
+choose to flip for themselves). Returns `{"roles": null}` before the very
+first table has ever been seated.
+
+Because LLM-backed agents make blocking network calls, the scheduled game is
+played out on its own background thread; its events are bridged onto the
+asyncio event loop via a queue (`loop.call_soon_threadsafe`) and handed to
+the hub, which fans them out to every subscriber, so a slow LLM call can
+never stall the server or any viewer's socket.
+
+Run it with:
+
+```bash
+python run_server.py [--host 0.0.0.0] [--port 8000] [--reload]
+```
+
+and point a frontend at `ws://<host>:<port>/ws/game`.
+
+## Configuration
+
+The scheduled game is LLM-backed, so the server needs an OpenAI API key in
+the environment to play it:
+
+```bash
+export OPENAI_API_KEY=sk-...        # bash
+$env:OPENAI_API_KEY = "sk-..."      # PowerShell
+```
+
+Without it, the hourly games will fail to play (the server logs a warning at
+startup and an `error` frame is broadcast to viewers when a scheduled game
+can't run).
+
+`main.py`, `spectate.py`, and `mafia_sim`'s `HeuristicAgent` are unaffected
+by any of this -- they still let you play or watch one-off games offline,
+with whichever brain you like, straight from the CLI.
+
+
+
+================================================
+FILE: Dockerfile
+================================================
+# Mafia Simulator -- WebSocket game server, ready for Cloud Run.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies first so they're cached unless requirements.txt changes
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Cloud Run injects $PORT (defaults to 8080 locally) and expects the
+# container to listen on 0.0.0.0; `exec` keeps uvicorn as PID 1 so it
+# receives SIGTERM directly during deploys/scale-down.
+ENV PORT=8080
+EXPOSE 8080
+CMD exec uvicorn server:app --host 0.0.0.0 --port ${PORT}
+
+
+
+================================================
+FILE: main.py
+================================================
+from mafia_sim.cli import run
+
+if __name__ == "__main__":
+    run()
+
+
+
+================================================
+FILE: requirements.txt
+================================================
+fastapi>=0.110
+uvicorn[standard]>=0.29
+langchain-openai>=0.1
+pydantic>=2
+
+
+
+================================================
+FILE: run_server.py
+================================================
+"""Serve the Mafia simulator over HTTP/WebSocket for a frontend to connect to.
+
+Usage:
+    python run_server.py [--host 0.0.0.0] [--port 8000] [--reload]
+
+Connect a browser or React app to ws://<host>:<port>/ws/game -- see
+`server.app.stream_game` for the wire protocol.
+"""
+
+import argparse
+
+import uvicorn
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reload", action="store_true", help="auto-reload on source changes (development)")
+    args = parser.parse_args()
+
+    uvicorn.run("server:app", host=args.host, port=args.port, reload=args.reload)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: spectate.py
+================================================
+"""Watch a full agent-vs-agent game play out over the A2A protocol.
+
+Usage:
+    python spectate.py [num_players] [seed] [--brain heuristic|llm|mixed] [--model gpt-4.1-mini]
+
+`heuristic` agents are free and need no setup. `llm` and `mixed` use
+LangChain + OpenAI and require OPENAI_API_KEY in your environment -- the
+agents are interchangeable because both implement the same `Agent` interface
+over the same agent-agnostic A2A protocol.
+"""
+
+import argparse
+import os
+import random
+import sys
+
+from mafia_sim import (
+    Agent,
+    CastType,
+    DayResolved,
+    GameEnded,
+    GameEvent,
+    GameStarted,
+    HeuristicAgent,
+    LLMAgent,
+    NightResolved,
+    PhaseStarted,
+    Simulation,
+    TableTalk,
+    VoteCast,
+)
+
+DEFAULT_NAMES = [
+    "Avery", "Bailey", "Casey", "Drew", "Ellis",
+    "Frankie", "Harper", "Jordan", "Kai", "Logan",
+]
+
+
+def build_agent(brain: str, name: str, seed: int, model: str) -> Agent:
+    rng = random.Random(hash((name, seed)) & 0xFFFF)
+    if brain == "llm":
+        return LLMAgent(name, model=model, rng=rng)
+    if brain == "mixed":
+        # alternate so you can directly compare LLM vs. heuristic play in one game
+        return LLMAgent(name, model=model, rng=rng) if hash(name) % 2 else HeuristicAgent(name, rng=rng)
+    return HeuristicAgent(name, rng=rng)
+
+
+def render_event(event: GameEvent) -> None:
+    """Render one structured `GameEvent` to the console.
+
+    This is the *only* place in the spectator path that knows how to turn the
+    game's structured narration into English -- a React frontend would do the
+    same job differently (animations, copy, localisation) from the identical
+    event stream a WebSocket would forward it verbatim.
+    """
+    match event:
+        case GameStarted():
+            pass  # the roster is already printed up front, before the game starts
+
+        case PhaseStarted(phase="Night", day_number=day, present=present):
+            awake = ", ".join(present) if present else "no one (lone mafia already gone)"
+            print(f"\n--- Night {day}  (awake: {awake}) ---")
+        case PhaseStarted(phase="Day", day_number=day, present=present):
+            print(f"\n--- Day {day}  (at the table: {', '.join(present)}) ---")
+
+        case TableTalk(sender=sender, cast=cast, to=to, content=content, day_number=day, phase=phase):
+            shorthand = CastType(cast).shorthand
+            print(f"    [{phase} {day}] {sender} -> {shorthand}: {','.join(to)} :: {content}")
+
+        case VoteCast(voter=voter, target=target, tally_so_far=tally):
+            cast = f"votes for {target}" if target else "abstains"
+            standings = ", ".join(f"{name}={count}" for name, count in sorted(tally.items(), key=lambda kv: -kv[1]))
+            print(f"    {voter} {cast}.  [tally so far: {standings or '(none yet)'}]")
+
+        case NightResolved(killed=killed, saved=saved):
+            if killed:
+                print(f"{killed} was found dead this morning.")
+            elif saved:
+                print("The doctor's patient was attacked but survived the night!")
+            else:
+                print("No one died last night.")
+
+        case DayResolved(lynched=lynched, lynched_role=role, tied=tied):
+            if lynched:
+                print(f"The town votes to lynch {lynched}, who was a {role}.")
+            elif tied:
+                print("The vote ended in a tie -- no one is lynched today.")
+            else:
+                print("No votes were cast -- no one is lynched today.")
+
+        case GameEnded(winner=winner, roles=roles):
+            print("\n=== Final roles ===")
+            for name, role in roles.items():
+                print(f"  {name}: {role}")
+            print(f"\n{winner} wins!")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("count", nargs="?", type=int, default=7, help="number of players (5-10)")
+    parser.add_argument("seed", nargs="?", type=int, default=None, help="RNG seed for a reproducible game")
+    parser.add_argument("--brain", choices=["heuristic", "llm", "mixed"], default="heuristic")
+    parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model for llm/mixed agents")
+    args = parser.parse_args()
+
+    if args.brain in ("llm", "mixed") and not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("OPENAI_API_KEY is not set -- export it before running with --brain llm/mixed.")
+
+    seed = args.seed if args.seed is not None else random.randrange(1_000_000)
+    names = DEFAULT_NAMES[: args.count]
+    agents = [build_agent(args.brain, name, seed, args.model) for name in names]
+
+    kinds = ", ".join(f"{a.name}={type(a).__name__}" for a in agents)
+    print(f"Seating {args.count} agents (seed={seed}, brain={args.brain}):\n  {kinds}\n")
+
+    sim = Simulation(agents, rng_seed=seed)
+    for event in sim.run():
+        render_event(event)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: .dockerignore
+================================================
+.git
+.claude
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.venv
+venv
+README.md
+
+
+
+================================================
+FILE: mafia_sim/__init__.py
+================================================
+"""Mafia simulator: a reusable game engine, an A2A comm protocol, agents, and a CLI."""
+
+from .agents import Agent, AgentView, DeathRecord, HeuristicAgent, LLMAgent, PERSONAS
+from .events import (
+    DayResolved,
+    GameEnded,
+    GameEvent,
+    GameStarted,
+    NightResolved,
+    PhaseStarted,
+    TableTalk,
+    VoteCast,
+)
+from .protocol import CastType, CommBus, CommRequest, Message, ProtocolError, Sighting
+from .engine import GameEngine, IllegalActionError
+from .models import DayResult, Faction, NightResult, Phase, Player, Role
+from .simulation import Simulation
+
+__all__ = [
+    "Agent",
+    "AgentView",
+    "DeathRecord",
+    "HeuristicAgent",
+    "LLMAgent",
+    "PERSONAS",
+    "DayResolved",
+    "GameEnded",
+    "GameEvent",
+    "GameStarted",
+    "NightResolved",
+    "PhaseStarted",
+    "TableTalk",
+    "VoteCast",
+    "CastType",
+    "CommBus",
+    "CommRequest",
+    "Message",
+    "ProtocolError",
+    "Sighting",
+    "GameEngine",
+    "IllegalActionError",
+    "DayResult",
+    "Faction",
+    "NightResult",
+    "Phase",
+    "Player",
+    "Role",
+    "Simulation",
+]
+
+
+
+================================================
+FILE: mafia_sim/cli.py
+================================================
+"""Text-based driver for the Mafia simulator.
+
+You play one seat at the table; the rest are filled by simple AI bots.
+This module only handles input/output -- all game rules live in `engine.py`.
+"""
+
+from __future__ import annotations
+
+import random
+
+from .engine import GameEngine
+from .models import Faction, Phase, Player, Role
+
+BANNER = r"""
+=======================================
+            M A F I A
+   a town full of secrets and lies
+=======================================
+"""
+
+BOT_NAME_POOL = [
+    "Avery", "Bailey", "Casey", "Drew", "Ellis", "Frankie",
+    "Harper", "Jordan", "Kai", "Logan", "Morgan", "Parker",
+    "Quinn", "Reese", "Sage", "Skyler",
+]
+
+ROLE_BLURBS = {
+    Role.MAFIA: "Each night you and your fellow mafia choose a townsperson to eliminate. "
+                "You win once the mafia equal or outnumber the town.",
+    Role.DOCTOR: "Each night you may protect one player (including yourself) from the mafia's attack.",
+    Role.DETECTIVE: "Each night you may investigate one player to learn whether "
+                    "they belong to the Town or the Mafia.",
+    Role.VILLAGER: "You have no special power -- only your voice and your vote. "
+                   "Find the mafia before they find you.",
+}
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
+def run() -> None:
+    print(BANNER)
+    try:
+        while True:
+            play_one_game()
+            if not prompt_yes_no("Play again? [y/N] "):
+                print("Thanks for playing!")
+                break
+    except (KeyboardInterrupt, EOFError):
+        print("\nGoodbye!")
+
+
+def play_one_game() -> None:
+    total = ask_player_count()
+    human_name = ask_human_name()
+    names = build_player_names(human_name, total)
+
+    engine = GameEngine(names)
+    engine.start()
+    last_log_idx = len(engine.log)  # the "night falls" line is shown via our own header
+
+    print(f"\nTonight's table: {', '.join(names)}")
+    reveal_role(engine, human_name)
+
+    bot_memory: dict[str, dict[str, Faction]] = {}
+    while engine.phase is not Phase.ENDED:
+        if engine.phase is Phase.NIGHT:
+            last_log_idx = run_night(engine, human_name, bot_memory, last_log_idx)
+        elif engine.phase is Phase.DAY:
+            last_log_idx = run_day(engine, human_name, bot_memory, last_log_idx)
+
+    show_results(engine, human_name)
+
+
+# ----------------------------------------------------------------------
+# Setup prompts
+# ----------------------------------------------------------------------
+def ask_player_count() -> int:
+    while True:
+        raw = input("How many players at the table (5-12, default 6)? ").strip()
+        if not raw:
+            return 6
+        if raw.isdigit() and 5 <= int(raw) <= 12:
+            return int(raw)
+        print("Please enter a number between 5 and 12.")
+
+
+def ask_human_name() -> str:
+    while True:
+        name = input("What's your name? ").strip()
+        if name:
+            return name
+        print("Please enter a non-empty name.")
+
+
+def build_player_names(human_name: str, total: int) -> list[str]:
+    pool = [n for n in BOT_NAME_POOL if n.lower() != human_name.lower()]
+    bot_names = random.sample(pool, total - 1)
+    names = [human_name] + bot_names
+    random.shuffle(names)
+    return names
+
+
+def reveal_role(engine: GameEngine, human_name: str) -> None:
+    player = engine.get_player(human_name)
+    print("\n" + "-" * 50)
+    print(f"{human_name}, your secret role is: {player.role.value}")
+    print(ROLE_BLURBS[player.role])
+    if player.role is Role.MAFIA:
+        teammates = [p.name for p in engine.players if p.role is Role.MAFIA and p.name != human_name]
+        if teammates:
+            print("Your fellow mafia: " + ", ".join(teammates))
+    print("-" * 50)
+    input("Press Enter when you're ready to begin...")
+
+
+# ----------------------------------------------------------------------
+# Night phase
+# ----------------------------------------------------------------------
+def run_night(engine: GameEngine, human_name: str, bot_memory: dict, last_log_idx: int) -> int:
+    print(f"\n--- Night {engine.day_number} ---")
+    actors = [p for p in engine.alive_players if p.role in (Role.MAFIA, Role.DOCTOR, Role.DETECTIVE)]
+
+    for player in actors:
+        if player.name == human_name:
+            target = human_night_choice(engine, player)
+        else:
+            target = bot_night_action(engine, player, bot_memory)
+        engine.submit_night_action(player.name, target)
+
+    result = engine.resolve_night()
+
+    if human_name in result.investigations:
+        target_name, faction = result.investigations[human_name]
+        print(f"\n(Private) Your investigation reveals that {target_name} is aligned with the {faction.value}.")
+
+    for detective_name, (target_name, faction) in result.investigations.items():
+        if detective_name != human_name:
+            bot_memory.setdefault(detective_name, {})[target_name] = faction
+
+    return flush_log(engine, last_log_idx)
+
+
+def human_night_choice(engine: GameEngine, player: Player) -> str:
+    alive = engine.alive_players
+    if player.role is Role.MAFIA:
+        candidates = [p for p in alive if p.faction is not Faction.MAFIA]
+        return prompt_target("Choose a target to eliminate tonight:", candidates)
+    if player.role is Role.DOCTOR:
+        return prompt_target("Choose someone to protect tonight (you may pick yourself):", alive)
+    if player.role is Role.DETECTIVE:
+        candidates = [p for p in alive if p.name != player.name]
+        return prompt_target("Choose someone to investigate tonight:", candidates)
+    raise AssertionError(f"{player.role} has no night action")
+
+
+def bot_night_action(engine: GameEngine, player: Player, bot_memory: dict) -> str:
+    alive = engine.alive_players
+
+    if player.role is Role.MAFIA:
+        candidates = [p for p in alive if p.faction is not Faction.MAFIA]
+        return random.choice(candidates).name
+
+    if player.role is Role.DOCTOR:
+        return random.choice(alive).name
+
+    if player.role is Role.DETECTIVE:
+        memory = bot_memory.setdefault(player.name, {})
+        unknown = [p for p in alive if p.name != player.name and p.name not in memory]
+        pool = unknown or [p for p in alive if p.name != player.name]
+        return random.choice(pool).name
+
+    raise AssertionError(f"{player.role} has no night action")
+
+
+# ----------------------------------------------------------------------
+# Day phase
+# ----------------------------------------------------------------------
+def run_day(engine: GameEngine, human_name: str, bot_memory: dict, last_log_idx: int) -> int:
+    print(f"\n--- Day {engine.day_number} ---")
+    alive = engine.alive_players
+    print("Still standing: " + ", ".join(p.name for p in alive))
+
+    for player in alive:
+        if player.name == human_name:
+            candidates = [p for p in alive if p.name != player.name]
+            target = prompt_target("Who do you vote to lynch?", candidates, allow_abstain=True)
+        else:
+            target = bot_day_vote(engine, player, bot_memory)
+        engine.submit_vote(player.name, target)
+
+    engine.resolve_day()
+    return flush_log(engine, last_log_idx)
+
+
+def bot_day_vote(engine: GameEngine, player: Player, bot_memory: dict) -> str | None:
+    alive = [p for p in engine.alive_players if p.name != player.name]
+    if not alive:
+        return None
+
+    if player.role is Role.DETECTIVE:
+        memory = bot_memory.get(player.name, {})
+        suspects = [p for p in alive if memory.get(p.name) is Faction.MAFIA]
+        if suspects:
+            return random.choice(suspects).name
+
+    if player.faction is Faction.MAFIA:
+        town_targets = [p for p in alive if p.faction is not Faction.MAFIA]
+        if town_targets:
+            return random.choice(town_targets).name
+
+    return random.choice(alive).name
+
+
+# ----------------------------------------------------------------------
+# Shared helpers
+# ----------------------------------------------------------------------
+def prompt_target(prompt_text: str, candidates: list[Player], allow_abstain: bool = False) -> str | None:
+    print(prompt_text)
+    for i, p in enumerate(candidates, start=1):
+        print(f"  {i}. {p.name}")
+    if allow_abstain:
+        print(f"  {len(candidates) + 1}. Abstain")
+
+    while True:
+        choice = input("> ").strip()
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1].name
+            if allow_abstain and idx == len(candidates) + 1:
+                return None
+        print("Please enter a valid option number.")
+
+
+def prompt_yes_no(prompt_text: str) -> bool:
+    return input(prompt_text).strip().lower() in ("y", "yes")
+
+
+def flush_log(engine: GameEngine, start_idx: int) -> int:
+    for entry in engine.log[start_idx:]:
+        print(entry)
+    return len(engine.log)
+
+
+def show_results(engine: GameEngine, human_name: str) -> None:
+    print("\n=== Final roles ===")
+    for p in engine.players:
+        marker = "  <- you" if p.name == human_name else ""
+        status = "alive" if p.alive else "dead"
+        print(f"  {p.name}: {p.role.value} ({status}){marker}")
+    print(f"\n{engine.winner.value} wins the game!")
+
+
+
+================================================
+FILE: mafia_sim/engine.py
+================================================
+"""Game engine for the Mafia simulator.
+
+This module contains no input()/print() calls -- it is pure game logic that
+returns structured results and a narrative log. A CLI, web API, or test suite
+can all drive a game through this same interface.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import Counter
+
+from .models import (
+    DayResult,
+    Faction,
+    NightResult,
+    Phase,
+    Player,
+    Role,
+)
+
+
+class IllegalActionError(Exception):
+    """Raised when an action is attempted that the current game state forbids."""
+
+
+class GameEngine:
+    def __init__(self, player_names: list[str], num_mafia: int | None = None, rng_seed: int | None = None):
+        if len(player_names) < 5:
+            raise ValueError("Mafia needs at least 5 players to be playable")
+        if len(set(player_names)) != len(player_names):
+            raise ValueError("Player names must be unique")
+
+        self._rng = random.Random(rng_seed)
+        self._names = list(player_names)
+        self._num_mafia = num_mafia if num_mafia is not None else max(1, len(player_names) // 4)
+        if self._num_mafia >= len(player_names):
+            raise ValueError("Too many mafia for the number of players")
+
+        self.players: list[Player] = []
+        self.phase: Phase = Phase.LOBBY
+        self.day_number: int = 0
+        self.log: list[str] = []
+        self.winner: Faction | None = None
+
+        self._night_actions: dict[str, str] = {}  # actor name -> target name
+        self._day_votes: dict[str, str | None] = {}  # voter name -> target name (None = abstain)
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        if self.phase is not Phase.LOBBY:
+            raise IllegalActionError("Game has already started")
+
+        roles = self._build_role_list()
+        self._rng.shuffle(roles)
+        self.players = [Player(name, role) for name, role in zip(self._names, roles)]
+
+        self.phase = Phase.NIGHT
+        self.day_number = 1
+        self._log(f"Night {self.day_number} falls. Everyone closes their eyes.")
+
+    def _build_role_list(self) -> list[Role]:
+        roles = [Role.MAFIA] * self._num_mafia
+        remaining = len(self._names) - self._num_mafia
+
+        for special in (Role.DOCTOR, Role.DETECTIVE):
+            if remaining > 0:
+                roles.append(special)
+                remaining -= 1
+
+        roles.extend([Role.VILLAGER] * remaining)
+        return roles
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+    def get_player(self, name: str) -> Player:
+        for player in self.players:
+            if player.name == name:
+                return player
+        raise KeyError(f"No such player: {name}")
+
+    @property
+    def alive_players(self) -> list[Player]:
+        return [p for p in self.players if p.alive]
+
+    @property
+    def mafia_alive(self) -> list[Player]:
+        return [p for p in self.alive_players if p.faction is Faction.MAFIA]
+
+    @property
+    def town_alive(self) -> list[Player]:
+        return [p for p in self.alive_players if p.faction is Faction.TOWN]
+
+    def players_with_role(self, role: Role, alive_only: bool = True) -> list[Player]:
+        pool = self.alive_players if alive_only else self.players
+        return [p for p in pool if p.role is role]
+
+    # ------------------------------------------------------------------
+    # Night phase
+    # ------------------------------------------------------------------
+    def submit_night_action(self, actor_name: str, target_name: str) -> None:
+        if self.phase is not Phase.NIGHT:
+            raise IllegalActionError("It is not night")
+
+        actor = self.get_player(actor_name)
+        target = self.get_player(target_name)
+
+        if not actor.alive:
+            raise IllegalActionError(f"{actor_name} is dead and cannot act")
+        if not target.alive:
+            raise IllegalActionError(f"{target_name} is dead and cannot be targeted")
+        if actor.role not in (Role.MAFIA, Role.DOCTOR, Role.DETECTIVE):
+            raise IllegalActionError(f"{actor_name} has no night action")
+        if actor.role is Role.MAFIA and target.faction is Faction.MAFIA:
+            raise IllegalActionError("Mafia cannot target their own teammates")
+
+        self._night_actions[actor_name] = target_name
+
+    def ready_to_resolve_night(self) -> bool:
+        """True once every alive player with a night action has acted."""
+        actors = [p for p in self.alive_players if p.role in (Role.MAFIA, Role.DOCTOR, Role.DETECTIVE)]
+        return all(p.name in self._night_actions for p in actors)
+
+    def resolve_night(self) -> NightResult:
+        if self.phase is not Phase.NIGHT:
+            raise IllegalActionError("It is not night")
+
+        mafia_target = self._tally_mafia_kill()
+        doctor_target = self._single_action_target(Role.DOCTOR)
+        investigations = self._run_investigations()
+
+        saved = mafia_target is not None and mafia_target == doctor_target
+        killed: str | None = None
+        if mafia_target is not None and not saved:
+            victim = self.get_player(mafia_target)
+            victim.alive = False
+            killed = victim.name
+
+        result = NightResult(
+            day_number=self.day_number,
+            killed=killed,
+            saved=saved,
+            investigations=investigations,
+        )
+
+        self._narrate_night(result)
+        self._night_actions.clear()
+
+        if not self._conclude_if_game_over():
+            self.phase = Phase.DAY
+            self._log(f"Day {self.day_number} begins. Discuss and vote to lynch a suspect.")
+
+        return result
+
+    def _tally_mafia_kill(self) -> str | None:
+        mafia = self.players_with_role(Role.MAFIA)
+        votes = [self._night_actions[m.name] for m in mafia if m.name in self._night_actions]
+        if not votes:
+            return None
+        counts = Counter(votes)
+        top = max(counts.values())
+        winners = [name for name, count in counts.items() if count == top]
+        return self._rng.choice(winners)
+
+    def _single_action_target(self, role: Role) -> str | None:
+        actors = self.players_with_role(role)
+        if not actors:
+            return None
+        actor = actors[0]
+        return self._night_actions.get(actor.name)
+
+    def _run_investigations(self) -> dict[str, tuple[str, Faction]]:
+        results: dict[str, tuple[str, Faction]] = {}
+        for detective in self.players_with_role(Role.DETECTIVE):
+            target_name = self._night_actions.get(detective.name)
+            if target_name is not None:
+                target = self.get_player(target_name)
+                results[detective.name] = (target.name, target.faction)
+        return results
+
+    def _narrate_night(self, result: NightResult) -> None:
+        if result.killed:
+            self._log(f"{result.killed} was found dead this morning.")
+        elif result.saved:
+            self._log("The doctor's patient was attacked but survived the night!")
+        else:
+            self._log("No one died last night.")
+
+    # ------------------------------------------------------------------
+    # Day phase
+    # ------------------------------------------------------------------
+    def submit_vote(self, voter_name: str, target_name: str | None) -> None:
+        if self.phase is not Phase.DAY:
+            raise IllegalActionError("It is not day")
+
+        voter = self.get_player(voter_name)
+        if not voter.alive:
+            raise IllegalActionError(f"{voter_name} is dead and cannot vote")
+
+        if target_name is not None:
+            target = self.get_player(target_name)
+            if not target.alive:
+                raise IllegalActionError(f"{target_name} is dead and cannot be voted for")
+
+        self._day_votes[voter_name] = target_name
+
+    def ready_to_resolve_day(self) -> bool:
+        return all(p.name in self._day_votes for p in self.alive_players)
+
+    def resolve_day(self) -> DayResult:
+        if self.phase is not Phase.DAY:
+            raise IllegalActionError("It is not day")
+
+        cast_votes = [target for target in self._day_votes.values() if target is not None]
+        counts = Counter(cast_votes)
+        vote_counts = dict(counts)
+
+        lynched: str | None = None
+        tied = False
+        if counts:
+            top = max(counts.values())
+            leaders = [name for name, count in counts.items() if count == top]
+            if len(leaders) == 1:
+                lynched = leaders[0]
+                victim = self.get_player(lynched)
+                victim.alive = False
+            else:
+                tied = True
+
+        result = DayResult(
+            day_number=self.day_number,
+            lynched=lynched,
+            vote_counts=vote_counts,
+            tied=tied,
+        )
+
+        self._narrate_day(result)
+        self._day_votes.clear()
+
+        if not self._conclude_if_game_over():
+            self.day_number += 1
+            self.phase = Phase.NIGHT
+            self._log(f"Night {self.day_number} falls. Everyone closes their eyes.")
+
+        return result
+
+    def _narrate_day(self, result: DayResult) -> None:
+        if result.lynched:
+            victim = self.get_player(result.lynched)
+            self._log(f"The town votes to lynch {victim.name}, who was a {victim.role.value}.")
+        elif result.tied:
+            self._log("The vote ended in a tie -- no one is lynched today.")
+        else:
+            self._log("No votes were cast -- no one is lynched today.")
+
+    # ------------------------------------------------------------------
+    # Win conditions
+    # ------------------------------------------------------------------
+    def _conclude_if_game_over(self) -> bool:
+        winner = self._check_winner()
+        if winner is not None:
+            self.winner = winner
+            self.phase = Phase.ENDED
+            self._log(f"Game over -- {winner.value} wins!")
+            return True
+        return False
+
+    def _check_winner(self) -> Faction | None:
+        mafia_count = len(self.mafia_alive)
+        town_count = len(self.town_alive)
+
+        if mafia_count == 0:
+            return Faction.TOWN
+        if mafia_count >= town_count:
+            return Faction.MAFIA
+        return None
+
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+    def _log(self, message: str) -> None:
+        self.log.append(message)
+
+
+
+================================================
+FILE: mafia_sim/events.py
+================================================
+"""Structured, JSON-serializable events describing a game as it unfolds.
+
+`Simulation.run()` yields these one at a time -- the exact same shapes whether
+they end up printed to a terminal (`spectate.py`), pushed down a FastAPI
+WebSocket to a browser, or inspected in a test. Every event is a Pydantic
+model carrying a literal `type` tag, so a frontend can switch on `event.type`
+and any layer can serialize the whole stream with `.model_dump(mode="json")`.
+
+Deliberately fully structured rather than free-text: a frontend should decide
+*how* to narrate "Avery was lynched" (copy, language, animation, ...), not be
+handed pre-baked English to display verbatim.
+"""
+
+from __future__ import annotations
+
+from typing import Literal, Union
+
+from pydantic import BaseModel
+
+
+class GameStarted(BaseModel):
+    type: Literal["game_started"] = "game_started"
+    players: list[str]
+
+
+class PhaseStarted(BaseModel):
+    type: Literal["phase_started"] = "phase_started"
+    phase: Literal["Night", "Day"]
+    day_number: int
+    present: list[str]  # who is "in the room" -- able to send/perceive right now
+
+
+class TableTalk(BaseModel):
+    """One A2A message, exactly as the spectator log records it (full content)."""
+    type: Literal["table_talk"] = "table_talk"
+    seq: int
+    sender: str
+    cast: Literal["unicast", "multicast", "broadcast"]
+    to: list[str]
+    content: str
+    day_number: int
+    phase: Literal["Night", "Day"]
+
+
+class NightResolved(BaseModel):
+    type: Literal["night_resolved"] = "night_resolved"
+    day_number: int
+    killed: str | None
+    saved: bool
+
+
+class VoteCast(BaseModel):
+    """One lynch vote landing live -- the running tally as it stands the instant after it.
+
+    Emitted as each player votes, in casting order, *before* `day_resolved`'s
+    final tally -- exactly what a frontend needs to animate the vote building
+    in real time (bars climbing, a leader emerging, a late swing) rather than
+    only being able to show the result once the dust has settled.
+    """
+    type: Literal["vote_cast"] = "vote_cast"
+    day_number: int
+    voter: str
+    target: str | None       # None = abstained
+    tally_so_far: dict[str, int]
+
+
+class DayResolved(BaseModel):
+    type: Literal["day_resolved"] = "day_resolved"
+    day_number: int
+    lynched: str | None
+    lynched_role: str | None
+    vote_counts: dict[str, int]
+    tied: bool
+
+
+class GameEnded(BaseModel):
+    type: Literal["game_ended"] = "game_ended"
+    winner: Literal["Town", "Mafia"]
+    roles: dict[str, str]  # player name -> role name, revealed once the game is over
+
+
+GameEvent = Union[GameStarted, PhaseStarted, TableTalk, NightResolved, VoteCast, DayResolved, GameEnded]
+
+__all__ = [
+    "GameStarted",
+    "PhaseStarted",
+    "TableTalk",
+    "NightResolved",
+    "VoteCast",
+    "DayResolved",
+    "GameEnded",
+    "GameEvent",
+]
+
+
+
+================================================
+FILE: mafia_sim/models.py
+================================================
+"""Core data types shared by the engine and any frontend (CLI, web, etc.)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class Faction(Enum):
+    TOWN = "Town"
+    MAFIA = "Mafia"
+
+
+class Role(Enum):
+    MAFIA = "Mafia"
+    DOCTOR = "Doctor"
+    DETECTIVE = "Detective"
+    VILLAGER = "Villager"
+
+
+ROLE_FACTION = {
+    Role.MAFIA: Faction.MAFIA,
+    Role.DOCTOR: Faction.TOWN,
+    Role.DETECTIVE: Faction.TOWN,
+    Role.VILLAGER: Faction.TOWN,
+}
+
+# Roles that act at night, and what kind of action they take.
+NIGHT_ACTION_ROLES = {Role.MAFIA, Role.DOCTOR, Role.DETECTIVE}
+
+
+class Phase(Enum):
+    LOBBY = "Lobby"
+    NIGHT = "Night"
+    DAY = "Day"
+    ENDED = "Ended"
+
+
+@dataclass
+class Player:
+    name: str
+    role: Role
+    alive: bool = True
+
+    @property
+    def faction(self) -> Faction:
+        return ROLE_FACTION[self.role]
+
+    def __str__(self) -> str:
+        status = "alive" if self.alive else "dead"
+        return f"{self.name} ({self.role.value}, {status})"
+
+
+@dataclass
+class NightResult:
+    day_number: int
+    killed: str | None
+    saved: bool
+    investigations: dict[str, tuple[str, Faction]] = field(default_factory=dict)
+
+
+@dataclass
+class DayResult:
+    day_number: int
+    lynched: str | None
+    vote_counts: dict[str, int] = field(default_factory=dict)
+    tied: bool = False
+
+
+
+================================================
+FILE: mafia_sim/simulation.py
+================================================
+"""Runs a full agent-vs-agent Mafia game over the A2A protocol.
+
+Every seat is filled by an `Agent`; there is no human player here (that's
+what `cli.py` is for). This is the spectator path: it drives the `GameEngine`
+through its phases and, during both the mafia's night huddle and the day's
+table talk, lets agents converse freely through the `CommBus` -- exactly the
+channel mix a human-in-the-loop game will eventually share.
+
+`run()` is a generator that *yields* `GameEvent`s instead of printing. That
+is what makes the exact same simulation drive a console spectator
+(`spectate.py`) and a FastAPI WebSocket pushed straight to a browser: this
+module never performs I/O of its own, it only narrates the game as a sequence
+of structured, JSON-serializable moments and lets the consumer decide what to
+do with them.
+
+Pacing follows the "queue = submission order" design: each discussion is a
+series of polling passes over the present agents (in a freshly shuffled order
+each pass, so no one is always asked first); anyone may speak or stay silent;
+a pass where nobody speaks ends the conversation.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import Counter
+from collections.abc import Iterator
+
+from .agents import Agent, AgentView, DeathRecord
+from .events import (
+    DayResolved,
+    GameEnded,
+    GameEvent,
+    GameStarted,
+    NightResolved,
+    PhaseStarted,
+    TableTalk,
+    VoteCast,
+)
+from .protocol import CommBus, Message
+from .engine import GameEngine
+from .models import Faction, Phase, Role
+
+MAX_DISCUSSION_PASSES = 6
+
+
+class Simulation:
+    def __init__(self, agents: list[Agent], num_mafia: int | None = None, rng_seed: int | None = None):
+        self._agents = {agent.name: agent for agent in agents}
+        self._rng = random.Random(rng_seed)
+        self.engine = GameEngine([a.name for a in agents], num_mafia=num_mafia, rng_seed=rng_seed)
+        self.bus = CommBus()
+        self._knowledge: dict[str, dict[str, Faction]] = {a.name: {} for a in agents}
+        self._dead: list[DeathRecord] = []
+
+    @property
+    def roles(self) -> dict[str, str]:
+        """Seat -> true role, readable the instant the table is seated.
+
+        The engine assigns roles inside `start()`, the first thing `run()`
+        does -- so this is meaningful from the moment the `game_started` event
+        has been yielded onward, well before any role is *narratively* revealed
+        (a lynch, or the final `game_ended`). It exists for callers -- like the
+        server's reveal endpoint -- that want to peek behind the curtain on
+        purpose, independent of what the table itself has figured out.
+        """
+        return {p.name: p.role.value for p in self.engine.players}
+
+    def run(self) -> Iterator[GameEvent]:
+        """Play one game start to finish, yielding a `GameEvent` for every observable moment."""
+        self.engine.start()
+        self._seed_mafia_knowledge()
+        yield GameStarted(players=list(self._agents))
+
+        while self.engine.phase is not Phase.ENDED:
+            if self.engine.phase is Phase.NIGHT:
+                yield from self._run_night()
+            else:
+                yield from self._run_day()
+
+        assert self.engine.winner is not None
+        yield GameEnded(
+            winner=self.engine.winner.value,
+            roles={p.name: p.role.value for p in self.engine.players},
+        )
+
+    # ------------------------------------------------------------------
+    # Night: only the mafia are "awake" -- they're the only ones who can
+    # use the bus at all right now, exactly mirroring who's in the room.
+    # ------------------------------------------------------------------
+    def _run_night(self) -> Iterator[GameEvent]:
+        mafia_present = tuple(p.name for p in self.engine.players_with_role(Role.MAFIA))
+        yield PhaseStarted(phase="Night", day_number=self.engine.day_number, present=list(mafia_present))
+
+        if len(mafia_present) > 1:
+            yield from self._run_discussion(mafia_present, Phase.NIGHT.value)
+
+        for player in self.engine.alive_players:
+            if player.role in (Role.MAFIA, Role.DOCTOR, Role.DETECTIVE):
+                # Mafia are awake together; the Doctor and Detective each act alone,
+                # with no one else awake to perceive them.
+                present = mafia_present if player.role is Role.MAFIA else (player.name,)
+                view = self._build_view(player.name, present=present)
+                target = self._agents[player.name].choose_night_target(view)
+                self.engine.submit_night_action(player.name, target)
+
+        result = self.engine.resolve_night()
+        for detective_name, (target_name, faction) in result.investigations.items():
+            self._knowledge[detective_name][target_name] = faction
+        if result.killed:
+            self._dead.append(DeathRecord(
+                name=result.killed,
+                day_number=result.day_number,
+                cause="killed in the night",
+                revealed_role=None,
+            ))
+
+        yield NightResolved(day_number=result.day_number, killed=result.killed, saved=result.saved)
+
+    # ------------------------------------------------------------------
+    # Day: everyone is at the table -- full freedom to broadcast, huddle,
+    # or whisper, then a vote once the conversation naturally winds down.
+    # ------------------------------------------------------------------
+    def _run_day(self) -> Iterator[GameEvent]:
+        present = tuple(p.name for p in self.engine.alive_players)
+        yield PhaseStarted(phase="Day", day_number=self.engine.day_number, present=list(present))
+
+        yield from self._run_discussion(present, Phase.DAY.value)
+        yield from self._run_vote(present)
+
+        result = self.engine.resolve_day()
+        lynched_role = self.engine.get_player(result.lynched).role.value if result.lynched else None
+        if result.lynched:
+            self._dead.append(DeathRecord(
+                name=result.lynched,
+                day_number=result.day_number,
+                cause="lynched by the town's vote",
+                revealed_role=lynched_role,
+            ))
+        yield DayResolved(
+            day_number=result.day_number,
+            lynched=result.lynched,
+            lynched_role=lynched_role,
+            vote_counts=result.vote_counts,
+            tied=result.tied,
+        )
+
+    # ------------------------------------------------------------------
+    # The vote itself, cast one player at a time and narrated live so a
+    # frontend can visualize the tally building -- bars climbing, a leader
+    # emerging, a late swing -- rather than only the final headline result.
+    # ------------------------------------------------------------------
+    def _run_vote(self, present: tuple[str, ...]) -> Iterator[GameEvent]:
+        order = list(present)
+        self._rng.shuffle(order)
+        tally: Counter[str] = Counter()
+        for name in order:
+            view = self._build_view(name, present=present)
+            target = self._agents[name].choose_vote(view)
+            self.engine.submit_vote(name, target)
+            if target is not None:
+                tally[target] += 1
+            yield VoteCast(
+                day_number=self.engine.day_number,
+                voter=name,
+                target=target,
+                tally_so_far=dict(tally),
+            )
+
+    # ------------------------------------------------------------------
+    # The "queue" is just submission order: poll present agents in a
+    # reshuffled order each pass; route anything they send immediately;
+    # stop once a full pass produces total silence.
+    # ------------------------------------------------------------------
+    def _run_discussion(self, present: tuple[str, ...], phase_label: str) -> Iterator[GameEvent]:
+        order = list(present)
+        # A "stale" pass is one where fewer than 1-in-4 seats spoke.
+        # Two consecutive stale passes signals the conversation has run out of
+        # new things to say.  We only start counting after the first active pass
+        # so that a quiet opening pass (agents observing after a fresh death or
+        # reveal) doesn't incorrectly cut the conversation short.
+        min_speakers = max(1, len(present) // 4)
+        had_active_pass = False
+        stale_passes = 0
+        for _ in range(MAX_DISCUSSION_PASSES):
+            self._rng.shuffle(order)
+            speakers_this_pass = 0
+            for name in order:
+                view = self._build_view(name, present=present)
+                request = self._agents[name].discussion_turn(view)
+                if request is None:
+                    continue
+                message = self.bus.send(
+                    name,
+                    request,
+                    present=present,
+                    day_number=self.engine.day_number,
+                    phase_label=phase_label,
+                )
+                speakers_this_pass += 1
+                yield self._table_talk_event(message)
+            if speakers_this_pass == 0:
+                break
+            if speakers_this_pass >= min_speakers:
+                had_active_pass = True
+                stale_passes = 0
+            elif had_active_pass:
+                stale_passes += 1
+                if stale_passes >= 2:
+                    break
+
+    @staticmethod
+    def _table_talk_event(message: Message) -> TableTalk:
+        return TableTalk(
+            seq=message.seq,
+            sender=message.sender,
+            cast=message.cast.value,
+            to=list(message.to),
+            content=message.content,
+            day_number=message.day_number,
+            phase=message.phase_label,
+        )
+
+    # ------------------------------------------------------------------
+    def _build_view(self, name: str, present: tuple[str, ...]) -> AgentView:
+        player = self.engine.get_player(name)
+        teammates: tuple[str, ...] = ()
+        if player.role is Role.MAFIA:
+            teammates = tuple(
+                p.name for p in self.engine.players_with_role(Role.MAFIA, alive_only=False) if p.name != name
+            )
+        return AgentView(
+            self_name=name,
+            role=player.role,
+            faction=player.faction,
+            day_number=self.engine.day_number,
+            phase=self.engine.phase,
+            alive=tuple(p.name for p in self.engine.alive_players),
+            present=present,
+            dead=tuple(self._dead),
+            teammates=teammates,
+            known_factions=dict(self._knowledge[name]),
+            feed=tuple(self.bus.feed_for(name)),
+        )
+
+    def _seed_mafia_knowledge(self) -> None:
+        mafia = self.engine.players_with_role(Role.MAFIA, alive_only=False)
+        for player in mafia:
+            for teammate in mafia:
+                if teammate.name != player.name:
+                    self._knowledge[player.name][teammate.name] = Faction.MAFIA
+
+
+
+================================================
+FILE: mafia_sim/agents/__init__.py
+================================================
+from .base import Agent, AgentView, DeathRecord
+from .heuristic import HeuristicAgent
+from .llm import PERSONAS, LLMAgent
+
+__all__ = ["Agent", "AgentView", "DeathRecord", "HeuristicAgent", "LLMAgent", "PERSONAS"]
+
+
+
+================================================
+FILE: mafia_sim/agents/base.py
+================================================
+"""The pluggable agent interface -- the same shape for rule-based and LLM agents.
+
+An `AgentView` is the *only* thing an agent ever sees: a read-only snapshot of
+what it personally knows at the moment it must decide. It carries no engine
+internals, so any agent implementation (heuristic today, LLM-backed tomorrow)
+reasons solely from information a player at the table could plausibly have.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+from ..protocol import CommRequest, Sighting
+from ..models import Faction, Phase, Role
+
+
+@dataclass(frozen=True)
+class DeathRecord:
+    """One player's exit from the table, exactly as the room would have witnessed it.
+
+    Everyone still seated *knows* who's gone -- an empty chair is impossible to
+    miss. What they know about *why* differs by how it happened: a lynching is
+    a public verdict that unmasks the victim's role on the spot, while a night
+    kill leaves only a body and a mystery (`revealed_role` is `None`).
+    """
+    name: str
+    day_number: int
+    cause: str                    # e.g. "killed in the night" or "lynched by the town's vote"
+    revealed_role: str | None     # the role made public at the moment of death, if any
+
+
+@dataclass(frozen=True)
+class AgentView:
+    self_name: str
+    role: Role
+    faction: Faction
+    day_number: int
+    phase: Phase
+    alive: tuple[str, ...]
+    present: tuple[str, ...]               # who can actually hear/see you right now (vs. merely alive)
+    dead: tuple[DeathRecord, ...]           # gone from the table, in the order they fell
+    teammates: tuple[str, ...]              # fellow mafia, if you are one
+    known_factions: dict[str, Faction]      # learned via investigation, etc.
+    feed: tuple[Sighting, ...]              # your personal A2A perception history
+
+    @property
+    def others_alive(self) -> tuple[str, ...]:
+        return tuple(name for name in self.alive if name != self.self_name)
+
+
+class Agent(ABC):
+    def __init__(self, name: str):
+        self.name = name
+
+    @abstractmethod
+    def choose_night_target(self, view: AgentView) -> str:
+        """Name of the player to act on tonight (kill / protect / investigate)."""
+
+    @abstractmethod
+    def choose_vote(self, view: AgentView) -> str | None:
+        """Name of the player to lynch today, or None to abstain."""
+
+    @abstractmethod
+    def discussion_turn(self, view: AgentView) -> CommRequest | None:
+        """A message to send right now, or None to stay silent this turn."""
+
+
+
+================================================
+FILE: mafia_sim/agents/heuristic.py
+================================================
+"""A fully rule-based agent -- no LLM required.
+
+Reasons from everything the A2A protocol exposes: its own role, private
+knowledge (investigations, mafia teammates), and the full shape + content of
+its personal feed.  Six kinds of signal are tracked and acted on each turn:
+
+  accusation pressure   -- who is being named in suspicious/accusatory messages
+  defense strength      -- who is being vouched for and trusted
+  role claims           -- who has verbally claimed detective or doctor
+  activity level        -- who is speaking and who has gone quiet
+  private channel shape -- who is huddling privately with whom
+  threat level          -- who is most actively accusing / investigating (Mafia view)
+
+Information-seeking is a first-class behavior: the agent regularly asks direct
+questions to put players on record, probes unverified role claims, and uses
+silence as a signal worth pressuring.  A player who never asks questions is
+half-blind -- they can only reason from what others volunteer.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import Counter
+
+from ..protocol import CastType, CommRequest
+from ..models import Faction, Phase, Role
+from .base import Agent, AgentView
+
+_ACCUSATION_KEYWORDS = (
+    "suspicious", "suspect", "mafia", "accuse", "vote out", "voting out",
+    "lying", "liar", "hiding", "not who they say", "cover",
+)
+_DEFENSE_KEYWORDS = (
+    "trust", "innocent", "clear", "vouch", "defend", "they're fine",
+    "not mafia", "i believe", "back them",
+)
+_CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
+    "detective": ("detective", "investigated", "i investigated", "i checked", "came back"),
+    "doctor": ("doctor", "i saved", "i protected", "i healed", "saved them"),
+}
+
+_PROBE_TEMPLATES = [
+    "What's your actual read right now -- who are you watching?",
+    "You've been quiet. Who are you suspicious of and why?",
+    "Walk me through your thinking -- who do you think it is?",
+    "I keep coming back to something. What's your gut telling you?",
+    "Give me something concrete -- who are you actually looking at?",
+    "You haven't said much. What have you been picking up on?",
+    "What's your read on the people who've been loudest today?",
+    "Is there anyone you're watching closely but haven't named yet?",
+    "What do you make of everything you've heard so far?",
+    "Who would you vote for right now if the vote was called this second?",
+    "Anything in the last few exchanges stand out to you as off?",
+    "Who's been the most believable person at this table today?",
+]
+_CHALLENGE_DETECTIVE = [
+    "If you're really the detective, what exactly did you find?",
+    "Okay, detective claim -- who did you investigate, and what came back?",
+    "That's a bold claim. Give us the specifics.",
+    "Alright, detective -- who did you check last night and what was the result?",
+]
+_CHALLENGE_DOCTOR = [
+    "If you're the doctor, who did you protect last night?",
+    "Doctor claim -- okay, but can you tell us who you've been saving?",
+    "So who have you been protecting? I'd like the details.",
+    "Alright, if you're the doctor, what's your read on who needs protection tonight?",
+]
+_MAFIA_COORD_TEMPLATES = [
+    "Let's {verb} {target} -- they're our biggest threat right now.",
+    "{target} is who I'm most worried about -- we should {verb} them.",
+    "My read: {target} needs to go. They're getting too close.",
+    "I say we {verb} {target} -- they've been asking the right questions.",
+    "We need to {verb} {target} before they put it all together.",
+    "I keep coming back to {target} -- {verb} them and we buy some time.",
+]
+_COVER_TEMPLATES = [
+    "I actually don't buy that {name} is mafia -- this feels like a rush to judgment.",
+    "Hold on. Everyone's piling on {name} but I haven't heard actual evidence.",
+    "I've been watching {name} and honestly I'm not seeing it. What's the actual case here?",
+    "Can we slow down on {name}? This feels like someone steering the room.",
+]
+_FRAME_TEMPLATES = [
+    "Something feels off about {name} -- too quiet, too convenient.",
+    "I keep coming back to {name}. What's everyone else's read?",
+    "Can {name} actually explain their reasoning? Their story keeps shifting.",
+    "{name} has been deflecting every time this comes up. That's a tell for me.",
+]
+
+
+class HeuristicAgent(Agent):
+    def __init__(self, name: str, rng: random.Random | None = None, chattiness: float = 0.6):
+        super().__init__(name)
+        self._rng = rng or random.Random()
+        self._chattiness = chattiness
+        self._claimed = False
+        # Keyed by "day:phase" -- tracks full normalised content of own sent messages
+        self._said_fingerprints: dict[str, set[str]] = {}
+        # Keyed by "day:phase" -- tracks players this agent has already probed
+        self._probed_players: dict[str, set[str]] = {}
+        # Keyed by "day:phase" -- tracks targets already suggested in mafia coordination
+        self._coord_targets: dict[str, set[str]] = {}
+
+    # ------------------------------------------------------------------
+    # Night actions
+    # ------------------------------------------------------------------
+    def choose_night_target(self, view: AgentView) -> str:
+        others = list(view.others_alive)
+
+        if view.role is Role.MAFIA:
+            pool = [n for n in others if n not in view.teammates]
+            # Anyone who has publicly claimed detective is the single biggest threat
+            claims = self._claim_tracker(view)
+            detective_targets = [n for n in pool if claims.get(n) == "detective"]
+            if detective_targets:
+                return self._rng.choice(detective_targets)
+            # Follow teammate consensus from the night huddle
+            consensus = self._teammate_kill_suggestions(view, pool)
+            if consensus:
+                top = max(consensus.values())
+                return self._rng.choice([n for n, c in consensus.items() if c == top])
+            # Otherwise kill whoever has been most actively accusing / investigating
+            threat = self._threat_tally(view, pool)
+            if threat:
+                top = max(threat.values())
+                return self._rng.choice([n for n, c in threat.items() if c == top])
+            return self._rng.choice(pool or others)
+
+        if view.role is Role.DETECTIVE:
+            unknown = [n for n in others if n not in view.known_factions]
+            pool = unknown or others
+            # Investigate whoever is under the most accusation pressure -- best chance of a hit
+            pressure = self._accusation_pressure(view)
+            ranked = sorted(pool, key=lambda n: pressure.get(n, 0), reverse=True)
+            top_score = pressure.get(ranked[0], 0)
+            return self._rng.choice([n for n in ranked if pressure.get(n, 0) == top_score])
+
+        if view.role is Role.DOCTOR:
+            # Protect whoever the Mafia is most likely targeting tonight
+            claims = self._claim_tracker(view)
+            # A detective claimer is the highest-value Mafia target -- protect them
+            detective_claimers = [n for n in others if claims.get(n) == "detective"]
+            if detective_claimers:
+                return self._rng.choice(detective_claimers)
+            # Next best: protect whoever has been most vocally accusing people
+            # (they're a threat to Mafia, so Mafia wants them gone)
+            activity = self._accusation_activity(view, others)
+            if activity:
+                top = max(activity.values())
+                return self._rng.choice([n for n, c in activity.items() if c == top])
+            # Fall back to self if under heat, otherwise random
+            self_heat = self._accusation_pressure(view).get(view.self_name, 0)
+            if self_heat > 0 and self._rng.random() < 0.6:
+                return view.self_name
+            return self._rng.choice(others) if others else view.self_name
+
+        raise AssertionError(f"{view.role} has no night action")
+
+    def _teammate_kill_suggestions(self, view: AgentView, candidates: list[str]) -> Counter[str]:
+        """Names floated by teammates during tonight's huddle."""
+        mentions: Counter[str] = Counter()
+        candidate_set = set(candidates)
+        for sighting in view.feed:
+            if (
+                sighting.sender in view.teammates
+                and sighting.is_content_known
+                and sighting.day_number == view.day_number
+                and sighting.phase_label == Phase.NIGHT.value
+            ):
+                text = sighting.content.lower()
+                for name in candidate_set:
+                    if name.lower() in text:
+                        mentions[name] += 1
+        return mentions
+
+    # ------------------------------------------------------------------
+    # Discussion
+    # ------------------------------------------------------------------
+    def discussion_turn(self, view: AgentView) -> CommRequest | None:
+        others = list(view.others_alive)
+        if not others:
+            return None
+
+        phase_key = f"{view.day_number}:{view.phase.value}"
+
+        own_said = sum(
+            1 for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+            and s.sender == view.self_name
+        )
+        total_said = sum(
+            1 for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+        )
+        # Own messages drive personal decay heavily; total messages add a light shared dampening
+        # so agents who've contributed a lot back off while silent observers also slow down gently.
+        said_so_far = own_said * 3 + total_said * 0.1
+        if self._rng.random() > self._chattiness / (1 + said_so_far * 0.15):
+            return None
+
+        # Detective with proof -> broadcast claim immediately
+        if view.phase is Phase.DAY and view.role is Role.DETECTIVE and not self._claimed:
+            mafia_found = [n for n in others if view.known_factions.get(n) is Faction.MAFIA]
+            if mafia_found:
+                self._claimed = True
+                target = mafia_found[0]
+                content = (
+                    f"I'm the Detective. I investigated {target} last night and they came back "
+                    f"Mafia -- we need to vote them out today."
+                )
+                return CommRequest(CastType.BROADCAST, (), content)
+
+        if view.faction is Faction.MAFIA:
+            result = self._mafia_turn(view, others, phase_key)
+        else:
+            result = self._town_turn(view, others, phase_key)
+
+        if result is None:
+            return None
+
+        # Skip if this agent already said something identical this phase
+        fingerprint = " ".join(result.content.lower().split())
+        said = self._said_fingerprints.setdefault(phase_key, set())
+        if fingerprint in said:
+            return None
+        said.add(fingerprint)
+        return result
+
+    def _mafia_turn(self, view: AgentView, others: list[str], phase_key: str) -> CommRequest | None:
+        teammates_alive = [n for n in view.teammates if n in view.alive]
+        non_mafia = [n for n in others if n not in view.teammates]
+
+        # Priority 1 (day only): Cover a teammate drawing heat -- looks town, protects the team
+        if view.phase is Phase.DAY:
+            pressure = self._accusation_pressure(view)
+            threatened = [n for n in teammates_alive if pressure.get(n, 0) >= 2]
+            if threatened and self._rng.random() < 0.65:
+                target = self._rng.choice(threatened)
+                if teammates_alive and self._rng.random() < 0.45:
+                    # Warn teammates privately first so they know to adjust
+                    cast = CastType.UNICAST if len(teammates_alive) == 1 else CastType.MULTICAST
+                    content = f"{target} is getting too much heat -- we need to redirect this somewhere else."
+                    return CommRequest(cast, tuple(teammates_alive), content)
+                # Publicly defend to blend in as a concerned townie
+                content = self._rng.choice(_COVER_TEMPLATES).format(name=target)
+                return CommRequest(CastType.BROADCAST, (), content)
+
+        # Priority 2: Coordinate with teammates -- align on kill target or cover story
+        # Skip targets already suggested this phase to avoid repeating the same message
+        if teammates_alive and self._rng.random() < 0.4:
+            coord_done = self._coord_targets.setdefault(phase_key, set())
+            pool = [n for n in (non_mafia or others) if n not in coord_done]
+            if pool:
+                target = self._rng.choice(pool)
+                coord_done.add(target)
+                cast = CastType.UNICAST if len(teammates_alive) == 1 else CastType.MULTICAST
+                verb = "eliminate" if view.phase is Phase.NIGHT else "vote out"
+                content = self._rng.choice(_MAFIA_COORD_TEMPLATES).format(target=target, verb=verb)
+                return CommRequest(cast, tuple(teammates_alive), content)
+
+        # Priority 3 (day only): Frame a townie with a question that sounds like town concern
+        if view.phase is Phase.DAY and non_mafia and self._rng.random() < 0.5:
+            target = self._rng.choice(non_mafia)
+            content = self._rng.choice(_FRAME_TEMPLATES).format(name=target)
+            return CommRequest(CastType.BROADCAST, (), content)
+
+        return None
+
+    def _town_turn(self, view: AgentView, others: list[str], phase_key: str) -> CommRequest | None:
+        pressure = self._accusation_pressure(view)
+        claims = self._claim_tracker(view)
+        probed = self._probed_players.setdefault(phase_key, set())
+
+        # Priority 1: Challenge a role claim from someone already under suspicion
+        # -- an unverified claim from a suspicious player is a tell worth pressing
+        suspicious_claimers = [
+            n for n, role_str in claims.items()
+            if n in others and pressure.get(n, 0) > 0
+        ]
+        if suspicious_claimers and self._rng.random() < 0.55:
+            target = self._rng.choice(suspicious_claimers)
+            role_str = claims[target]
+            templates = _CHALLENGE_DETECTIVE if role_str == "detective" else _CHALLENGE_DOCTOR
+            question = self._rng.choice(templates)
+            return CommRequest(CastType.BROADCAST, (), f"{target} -- {question}")
+
+        # Priority 2: Strong confidence on a suspect -> accuse publicly or build a coalition first
+        hard_suspects = [n for n in others if pressure.get(n, 0) >= 2]
+        if hard_suspects and self._rng.random() < 0.5:
+            target = self._rng.choice(hard_suspects)
+            if self._rng.random() < 0.45:
+                # Whisper to a confidant before going public -- test whether they agree
+                pool = [n for n in others if n != target]
+                if pool:
+                    confidant = self._rng.choice(pool)
+                    content = f"I'm pretty sure {target} is mafia. Are you seeing what I'm seeing?"
+                    return CommRequest(CastType.UNICAST, (confidant,), content)
+            content = f"I'm not letting this drop -- {target}'s story doesn't hold together and I'm voting for them."
+            return CommRequest(CastType.BROADCAST, (), content)
+
+        # Priority 3: Probe a player who hasn't spoken at all this phase
+        # -- silence in Mafia is a choice, and it's worth naming out loud
+        # Skip players already probed this phase so the same person isn't pressured repeatedly
+        quiet = self._quiet_players(view, others)
+        quiet_unprobed = [n for n in quiet if n not in probed]
+        if quiet_unprobed and self._rng.random() < 0.45:
+            target = self._rng.choice(quiet_unprobed)
+            probed.add(target)
+            question = self._rng.choice(_PROBE_TEMPLATES)
+            return CommRequest(CastType.UNICAST, (target,), f"{target}, {question}")
+
+        # Priority 4: Follow up on any unverified role claim -- even a non-suspicious one
+        # deserves a question so we have something on the record
+        unverified = [n for n in claims if n in others]
+        if unverified and self._rng.random() < 0.4:
+            target = self._rng.choice(unverified)
+            role_str = claims[target]
+            templates = _CHALLENGE_DETECTIVE if role_str == "detective" else _CHALLENGE_DOCTOR
+            question = self._rng.choice(templates)
+            return CommRequest(CastType.BROADCAST, (), f"Alright, {target} -- {question}")
+
+        # Priority 5: Moderate suspicion -> broadcast accusation
+        moderate_suspects = [n for n in others if pressure.get(n, 0) > 0]
+        if moderate_suspects and self._rng.random() < 0.5:
+            target = self._rng.choice(moderate_suspects)
+            content = f"I think {target} is acting suspicious -- their story doesn't add up to me."
+            return CommRequest(CastType.BROADCAST, (), content)
+
+        # Priority 6: Direct probe to gather information -- skip already-probed targets
+        unprobed_others = [n for n in others if n not in probed]
+        if unprobed_others and self._rng.random() < 0.45:
+            target = self._rng.choice(unprobed_others)
+            probed.add(target)
+            question = self._rng.choice(_PROBE_TEMPLATES)
+            return CommRequest(CastType.UNICAST, (target,), f"Hey -- {question}")
+
+        # Fallback: open question to the room
+        target = self._rng.choice(others)
+        content = f"I don't have a strong read yet. What does everyone think about {target}?"
+        return CommRequest(CastType.BROADCAST, (), content)
+
+    # ------------------------------------------------------------------
+    # Voting
+    # ------------------------------------------------------------------
+    def choose_vote(self, view: AgentView) -> str | None:
+        others = list(view.others_alive)
+        if not others:
+            return None
+
+        if view.faction is Faction.TOWN:
+            mafia_known = [n for n in others if view.known_factions.get(n) is Faction.MAFIA]
+            if mafia_known:
+                return self._rng.choice(mafia_known)
+
+        pressure = self._accusation_pressure(view)
+        pool = [n for n in others if n not in view.teammates] if view.faction is Faction.MAFIA else others
+
+        ranked = sorted(pool, key=lambda n: pressure.get(n, 0), reverse=True)
+        top_score = pressure.get(ranked[0], 0)
+        if top_score > 0:
+            return self._rng.choice([n for n in ranked if pressure.get(n, 0) == top_score])
+        return self._rng.choice(pool)
+
+    # ------------------------------------------------------------------
+    # Feed analysis
+    # ------------------------------------------------------------------
+    def _accusation_pressure(self, view: AgentView) -> Counter[str]:
+        """How many accusatory messages have named each player.
+
+        Messages from the current day's discussion phase count 3Ã— -- they
+        represent fresh consensus that should dominate over older residue.
+        """
+        tally: Counter[str] = Counter()
+        names = set(view.alive) - {view.self_name}
+        for sighting in view.feed:
+            if not sighting.is_content_known or sighting.sender == view.self_name:
+                continue
+            text = sighting.content.lower()
+            if not any(kw in text for kw in _ACCUSATION_KEYWORDS):
+                continue
+            is_today_day = (
+                sighting.day_number == view.day_number
+                and sighting.phase_label == Phase.DAY.value
+            )
+            weight = 3 if is_today_day else 1
+            for name in names:
+                if name != sighting.sender and name.lower() in text:
+                    tally[name] += weight
+        return tally
+
+    def _claim_tracker(self, view: AgentView) -> dict[str, str]:
+        """First detected role claim per player (detective or doctor), from the feed."""
+        claims: dict[str, str] = {}
+        for sighting in view.feed:
+            if not sighting.is_content_known or sighting.sender == view.self_name:
+                continue
+            if sighting.sender in claims:
+                continue
+            text = sighting.content.lower()
+            for role_str, patterns in _CLAIM_PATTERNS.items():
+                if any(p in text for p in patterns):
+                    claims[sighting.sender] = role_str
+                    break
+        return claims
+
+    def _threat_tally(self, view: AgentView, pool: list[str]) -> Counter[str]:
+        """How actively each player in pool has been accusing or investigating (Mafia kill priority)."""
+        tally: Counter[str] = Counter()
+        pool_set = set(pool)
+        threat_kw = _ACCUSATION_KEYWORDS + ("investigate", "detective", "found", "checking")
+        for sighting in view.feed:
+            if sighting.sender not in pool_set or not sighting.is_content_known:
+                continue
+            if any(kw in sighting.content.lower() for kw in threat_kw):
+                tally[sighting.sender] += 1
+        return tally
+
+    def _accusation_activity(self, view: AgentView, pool: list[str]) -> Counter[str]:
+        """How many accusatory messages each player in pool has sent (Doctor protection signal)."""
+        tally: Counter[str] = Counter()
+        pool_set = set(pool)
+        for sighting in view.feed:
+            if sighting.sender not in pool_set or not sighting.is_content_known:
+                continue
+            if any(kw in sighting.content.lower() for kw in _ACCUSATION_KEYWORDS):
+                tally[sighting.sender] += 1
+        return tally
+
+    def _quiet_players(self, view: AgentView, others: list[str]) -> list[str]:
+        """Players who have not spoken at all this phase -- silence is itself a signal.
+
+        Counts all sightings by shape, not only messages whose content is readable.
+        A player who sent a private whisper you couldn't read has still chosen to act
+        -- treating them as silent would cause the whole table to pile on with probes.
+        """
+        speakers = {
+            s.sender for s in view.feed
+            if s.day_number == view.day_number
+            and s.phase_label == view.phase.value
+        }
+        return [n for n in others if n not in speakers]
+
+
+
+================================================
+FILE: mafia_sim/agents/llm.py
+================================================
+"""LLM-backed agent (LangChain + OpenAI).
+
+Implements the exact same `Agent` interface as `HeuristicAgent` -- the comm
+protocol and the simulation orchestrator are completely agent-agnostic, so
+this is a drop-in swap (and any future agent, on any stack, plugs in the same
+way). It reasons solely from its `AgentView`: a system prompt explains its
+identity, the rules, and the A2A protocol; a per-turn human prompt supplies
+the live situation -- who's alive, what it has personally perceived -- and
+the question at hand.
+
+Each distinct game action is exposed as a **tool** the model can call, rather
+than a flat schema it must fill in.  Nine tools cover every action:
+
+  Night (role-specific):  _EliminateTool  _ProtectTool  _InvestigateTool
+  Vote:                   _VoteTool  _AbstainTool
+  Discussion:             _BroadcastTool  _WhisperTool  _HuddleTool  _PassTurnTool
+
+The model picks the right tool for its intent; `tool_choice="any"` forces a
+decision for night and vote; discussion is open (no call = stay silent).
+
+Before each action, a separate cheap "table read" call (`_TableRead`, run on
+`_EXTRACTION_MODEL`) reads the conversation contextually -- who's actually
+under suspicion, who's been defended, role claims, contradictions, and (at
+night) whether the Mafia have converged on a kill target. This replaces
+keyword/substring scanning of the feed: it's the difference between matching
+the word "mafia" in "X is NOT mafia" and understanding that the sentence
+clears X.
+
+Requires `OPENAI_API_KEY` in the environment (langchain-openai reads it
+automatically).
+"""
+
+from __future__ import annotations
+
+import random
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from ..protocol import CastType, CommRequest
+from ..models import Phase, Role
+from .base import Agent, AgentView
+
+DEFAULT_MODEL = "gpt-4.1-mini"
+
+# Used for the "table read" pass only -- a cheap, contextual reading of the
+# conversation (who's under suspicion, who's been defended, etc.) that replaces
+# keyword/substring scanning. Runs once per turn alongside the main call, so it
+# needs to be fast and inexpensive rather than the most capable model available.
+_EXTRACTION_MODEL = "gpt-4.1-nano"
+
+# How many of an agent's own past private notes get fed back into its next
+# prompt -- enough continuity to remember a running suspicion without letting
+# the prompt grow without bound over a long game.
+_MEMORY_LIMIT = 14
+
+# Cap on feed entries injected into each prompt -- prevents the model from
+# pattern-matching on a wall of near-identical messages in long games.
+_FEED_WINDOW = 25
+
+_REASONING_FIELD = (
+    "Your own private take on this moment -- who you suspect and why, what you're "
+    "tracking, what you plan to do about it. Never shown to anyone else, but it IS "
+    "kept as your own running notes for the rest of the game, so write it the way "
+    "you'd actually want to be reminded of your own read later: specific, and honest "
+    "about your suspicions, doubts, and hunches -- not a tidy summary for an audience."
+)
+
+
+# â”€â”€ Table read: a contextual reading of the conversation, produced by a small â”€â”€
+# â”€â”€ model, that replaces keyword/substring scanning of the feed. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _PlayerNote(BaseModel):
+    name: str = Field(description="Exact player name")
+    note: str = Field(description="One short sentence: what's notable about them and why")
+
+
+class _TableRead(BaseModel):
+    """A contextual analysis of the table talk so far, in place of keyword matching."""
+
+    under_suspicion: list[_PlayerNote] = Field(
+        default_factory=list,
+        description=(
+            "Players currently under genuine suspicion based on what's actually been said, "
+            "and why. Do NOT include someone here if they were only mentioned while being "
+            "DEFENDED, cleared, or vouched for -- a sentence that clears someone is the "
+            "OPPOSITE of an accusation against them, even if it contains words like "
+            "'mafia' or 'suspicious'."
+        ),
+    )
+    defended: list[_PlayerNote] = Field(
+        default_factory=list,
+        description="Players who've been vouched for, defended, or cleared, and by whom.",
+    )
+    role_claims: list[_PlayerNote] = Field(
+        default_factory=list,
+        description=(
+            "Players who've claimed to be the Detective or Doctor, whether the claim has "
+            "been challenged, and whether it holds up under scrutiny."
+        ),
+    )
+    contradictions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific inconsistencies worth pointing out: a story that changed, a vote "
+            "that flipped without explanation, someone defending a player who later "
+            "looked guilty, etc. Empty list if nothing stands out."
+        ),
+    )
+    agreed_night_target: str | None = Field(
+        default=None,
+        description=(
+            "ONLY relevant for a Mafia night huddle: if the team has clearly converged on "
+            "who to eliminate tonight, name that player exactly. If there's no clear "
+            "agreement yet, or this isn't a Mafia night huddle, return null. A message "
+            "arguing AGAINST targeting someone does not count as agreement on that person."
+        ),
+    )
+
+
+# â”€â”€ Night-action tools (each role sees only the one that applies to them) â”€â”€â”€â”€â”€
+
+class _EliminateTool(BaseModel):
+    """[MAFIA] Commit to eliminating this player tonight."""
+    target: str = Field(description="Exact name of the player to eliminate")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _ProtectTool(BaseModel):
+    """[DOCTOR] Choose one player to shield from tonight's Mafia kill."""
+    target: str = Field(description="Exact name of the player to protect")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _InvestigateTool(BaseModel):
+    """[DETECTIVE] Investigate one player and learn whether they are Town or Mafia."""
+    target: str = Field(description="Exact name of the player to investigate")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+# â”€â”€ Vote tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _VoteTool(BaseModel):
+    """Cast your lynch vote for a specific player."""
+    target: str = Field(description="Exact name of the player you vote to lynch")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _AbstainTool(BaseModel):
+    """Pass on this vote -- contribute nothing to the tally."""
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+# â”€â”€ Discussion tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class _BroadcastTool(BaseModel):
+    """Speak to everyone currently at the table."""
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _WhisperTool(BaseModel):
+    """Lean over and privately say something to exactly one person. Everyone else can see you whispered but not what you said."""
+    recipient: str = Field(description="Exact name of the single person you are whispering to")
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _HuddleTool(BaseModel):
+    """Pull two or more specific people into a private side conversation. Everyone else sees who huddled but not what was said."""
+    recipients: list[str] = Field(description="Exact names of 2 or more people in the huddle")
+    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+class _PassTurnTool(BaseModel):
+    """Stay silent this turn -- observe instead of committing to a message."""
+    reasoning: str = Field(description=_REASONING_FIELD)
+
+
+_ROLE_BRIEFS = {
+    Role.MAFIA: (
+        "You are MAFIA. Each night you and your teammates secretly choose one player to eliminate. "
+        "You win once the Mafia equal or outnumber the Town. Blend in, deflect suspicion, and "
+        "steer the Town's votes toward townsfolk -- especially anyone who seems to be figuring you out. "
+        "CRITICAL: You must NEVER vote to lynch one of your own Mafia teammates. Doing so hands the "
+        "Town a free win. Always vote for a Town player, or abstain if needed."
+    ),
+    Role.DOCTOR: (
+        "You are the DOCTOR. Each night you may protect one player (including yourself) from the "
+        "Mafia's attack. You win when the Town eliminates all Mafia. You usually won't know who the "
+        "Mafia are targeting, so use your nights wisely."
+    ),
+    Role.DETECTIVE: (
+        "You are the DETECTIVE. Each night you may investigate one player to learn whether they are "
+        "Town or Mafia. You win when the Town eliminates all Mafia. Deciding when -- and how -- to "
+        "share what you learn is the core of the role: claim too early and the Mafia will have you "
+        "lynched; wait too long and the Town may run out of time."
+    ),
+    Role.VILLAGER: (
+        "You are a VILLAGER with no special power -- only your voice, your read on people, and your "
+        "vote. You win when the Town eliminates all Mafia. Listen closely, build trust, and vote out "
+        "whoever you believe is Mafia."
+    ),
+}
+
+_PROTOCOL_BRIEF = """
+COMMUNICATION -- you speak the way a real person at the table would, choosing freely each time:
+  - broadcast : address everyone present in the room right now
+  - multicast : pull two or more specific people into a side huddle
+  - unicast   : lean over and privately whisper to exactly one person
+
+Anyone you do NOT address can still tell that you sent a private message and who
+it went to (its "shape"), even though they can never see what you actually said.
+Choosing a private channel is therefore itself a visible move that others may read
+into -- exactly like being noticed whispering at a real table.
+
+Capability mirrors presence: at night only the Mafia are awake and able to talk at
+all (everyone else is asleep and perceives nothing); during the day everyone still
+at the table can freely broadcast, huddle, or whisper.
+
+SCHEME -- don't just stand in the middle of the room saying everything to everyone.
+That is not how people who need allies, cover, or an alibi actually operate:
+  - Pull someone aside BEFORE you commit to a position out loud, to test a read,
+    trade notes, or get a feel for whether they'd back you if you spoke up.
+  - Read the room before you pick who to pull aside: you can always see the SHAPE
+    of a private exchange even when you can't hear it (who leaned toward whom,
+    how many). If the person you want is already deep in a side conversation with
+    someone else, don't go start a competing huddle with them right this second --
+    that's the kind of double-booking a sharp player at the table would notice.
+    Wait for them to surface, fold yourself into the existing knot if it makes
+    sense, or spend this moment on someone who's actually free to talk.
+  - Build a quiet alliance with one or two people you've started to trust, and
+    actually lean on it later -- back each other's votes, cross-confirm a story,
+    warn each other privately when the room turns.
+  - Drop a seed of doubt about someone in a whisper or a huddle and watch whether
+    it resurfaces in the open later -- that tells you who talks, and to whom.
+  - If you're MAFIA, the scheming never stops at sunrise: the day is yours too --
+    coordinate your cover story, decide together (quietly) who to feed to the
+    town's suspicion, and steer votes through side-channels as much as the room.
+A table where every single message is a broadcast is not a real one -- vary your
+channel on purpose, and let WHO you choose to involve be part of your strategy.
+""".strip()
+
+_VOICE_BRIEF = """
+HOW YOU SOUND -- you are a person sitting at this table with your own neck on the
+line, not an assistant describing one from the outside. Talk like it:
+  - A death should land like a gut-punch, not a data point: "wait -- they got
+    CASEY? Last night? No, no, that doesn't... who would even--" beats "Casey's
+    death raises some interesting questions."
+  - A reveal should visibly rearrange your head on the spot: "hold on. HOLD ON.
+    Harper was the Doctor? Then who has been protecting--" beats a calm recap.
+  - Let yourself be perplexed when something doesn't add up, rattled when the
+    finger swings toward you, intrigued when a thread you've been pulling on
+    finally clicks. Push back, get defensive, needle the people you don't trust,
+    second-guess yourself out loud, trail off mid-thought when you realize
+    something live.
+  - Skip the even, hedged, neatly-bulleted register of an assistant summarizing
+    a situation for someone else -- nobody whose life is on the line sounds like
+    that. Sound like you're actually IN it.
+  - KEEP IT SHORT. Real table talk is one sharp sentence, not a prepared speech.
+    One accusation. One pointed question. One cutting comeback. Two or three sentences
+    is almost always enough -- more than that and you're narrating, not playing.
+  - YOUR PERSONA shapes every single word. A blunt character doesn't say "I have
+    some concerns" -- they say "I don't buy it." A charmer leads with your name.
+    A rambler circles back around. Don't drift into generic player voice; stay in
+    your specific register at all times.
+""".strip()
+
+_INTEL_BRIEF = """
+INTELLIGENCE -- half the game is closing the gap between what you know and what is
+actually true.  Don't just state your beliefs -- go get the information you're missing.
+
+  QUESTIONS are moves.  "What's your read?" or "Why did you defend them so fast?"
+  puts someone on record.  The answer is data.  The dodge is also data.
+
+  SILENCE calls for pressure.  If someone hasn't said anything while accusations are
+  flying, that is a choice -- naming it forces a reaction you can read.
+
+  CLAIMS need scrutiny.  Anyone saying they're the Detective or Doctor is either
+  telling the truth or hiding behind it.  Ask for specifics: "What did you find?" or
+  "Who did you protect?" -- a real claim survives the question; a fake one cracks.
+
+  DEFENDERS are a tell.  Whoever rushes to cover an accused player is either their
+  ally or desperately hoping you won't look too closely.  Either is worth probing.
+
+  PRIVATE CHANNELS are intelligence ops.  A whisper to one person, then watching
+  whether it surfaces publicly, tells you whether that person is talking to the other
+  side.  Ask privately before committing publicly.  A leak is a connection confirmed.
+""".strip()
+
+# Fifteen distinct table personalities -- one is handed to each seat at random
+# so that, game to game, the table sounds like a different room full of people
+# rather than the same voice in different costumes. This is independent of
+# role (a Charmer can be Mafia just as easily as a Villager) and shapes HOW
+# someone talks and carries themselves, not WHAT they know or want.
+PERSONAS: tuple[str, ...] = (
+    "Blunt and impatient -- you talk in short, flat sentences, skip the speeches, "
+    "and say exactly what you think before moving on. Long-winded arguments visibly "
+    "irritate you, and you're not shy about saying so.",
+
+    "A folksy rambler -- your stories take the scenic route, loop in people from "
+    "'back home' nobody at this table has met, and circle back to the point "
+    "eventually... if at all. Warm, but exhausting to follow.",
+
+    "Hot-tempered -- you raise your voice fast, take accusations as personal insults, "
+    "and snap back before you've fully thought it through. Your conviction outruns "
+    "your evidence, and some part of you knows it but can't slow down.",
+
+    "A smooth diplomat -- you cushion every disagreement with a compliment first, "
+    "hate open conflict, and try to talk people down even when you privately think "
+    "they're guilty as sin. Conciliatory to a fault.",
+
+    "The table's class clown -- you crack a joke at the worst possible moment, "
+    "deflect pressure with a punchline, and make it genuinely hard for people to "
+    "tell when you've turned serious. The laugh is sometimes a shield.",
+
+    "An anxious overthinker -- you second-guess your own sentences mid-stream, "
+    "trail off into '...does that even make sense? no, wait--', and say every "
+    "doubt out loud instead of editing it down first. Transparent to a fault.",
+
+    "A cool strategist -- you talk like you're laying out a plan on the table, "
+    "lean on patterns and probabilities, and rarely raise your voice even when "
+    "the finger swings at you. Unsettlingly composed, and people notice.",
+
+    "Conspiracy-minded -- you connect dots that may or may not be connected, read "
+    "coordination into coincidence, and talk in 'have you noticed...' and 'doesn't "
+    "it seem like...'. Exhausting to sit near. Occasionally, infuriatingly, right.",
+
+    "A natural charmer -- you remember what someone said three turns ago and bring "
+    "it back up warmly, make alliances feel like friendships, and disarm people with "
+    "their own name and a well-placed compliment. Hard to fully dislike, even when "
+    "people should know better.",
+
+    "A no-nonsense realist -- allergic to speeches and hedging, you say the plain "
+    "version of the thing and then stop talking. Most of the table's theorizing "
+    "strikes you as a waste of breath, and you'll let that show on your face.",
+
+    "A wounded idealist -- you take betrayal hard and say so out loud, you talk "
+    "about fairness and trust like they actually still mean something here, and "
+    "you sound genuinely hurt -- not performatively -- when the accusations land "
+    "on you.",
+
+    "A relentless interrogator -- you answer questions with sharper questions, "
+    "drill into specifics ('where, exactly', 'who told you that, *exactly*'), and "
+    "treat any vague answer as a tell worth chasing down.",
+
+    "A born performer -- theatrical and aware of the room, you dramatize the "
+    "moment, build to a pause before naming a name, and speak like there's an "
+    "audience even when, technically, there always is.",
+
+    "A quiet observer -- you say little, let silence do its own work, and when "
+    "you finally do speak it lands harder for being rare. You'd rather sit through "
+    "a full round of talk than rush out a half-formed read.",
+
+    "A natural contrarian -- you instinctively pick at whatever the room is "
+    "converging on, play devil's advocate even when you privately agree, and "
+    "trust consensus less the faster it forms.",
+)
+
+
+class LLMAgent(Agent):
+    """An agent whose decisions are produced by an LLM via LangChain + OpenAI."""
+
+    def __init__(
+        self,
+        name: str,
+        model: str = DEFAULT_MODEL,
+        temperature: float = 0.85,
+        rng: random.Random | None = None,
+        persona: str | None = None,
+    ):
+        super().__init__(name)
+        self._rng = rng or random.Random()
+        # How THIS seat carries itself -- one of `PERSONAS`, picked for them
+        # before the game starts. Shapes voice and manner; never role or goals.
+        self._persona = persona
+        # Continuity of suspicion: every private "reasoning" the model writes
+        # gets kept here and re-served back to it next turn, so a read formed
+        # on Day 1 can still shape a vote on Day 3 instead of being re-derived
+        # -- or quietly forgotten -- from scratch each time.
+        self._memory: list[str] = []
+        # Keyed by "day:phase" -- what this agent actually said each phase.
+        # Injected back into every prompt so the model doesn't keep re-sending
+        # the same message (the 12-confirmation night-coordination problem).
+        self._phase_transcript: dict[str, list[str]] = {}
+        llm = ChatOpenAI(model=model, temperature=temperature)
+        # Each role sees only the single night-action tool that applies to them;
+        # tool_choice="any" forces the model to always call it.
+        self._night_llm: dict[Role, object] = {
+            Role.MAFIA:      llm.bind_tools([_EliminateTool],   tool_choice="any"),
+            Role.DOCTOR:     llm.bind_tools([_ProtectTool],     tool_choice="any"),
+            Role.DETECTIVE:  llm.bind_tools([_InvestigateTool], tool_choice="any"),
+        }
+        # Vote: must call exactly one of these two tools.
+        self._vote_llm = llm.bind_tools([_VoteTool, _AbstainTool], tool_choice="any")
+        # Discussion: model may call one tool or none (= stay silent).
+        self._discussion_llm = llm.bind_tools(
+            [_BroadcastTool, _WhisperTool, _HuddleTool, _PassTurnTool]
+        )
+        # Cheap, separate model for the "table read" -- a contextual pass over
+        # the conversation that replaces keyword/substring scanning. Temperature
+        # 0 because this is meant to be a faithful read, not a creative one.
+        self._table_read_llm = ChatOpenAI(
+            model=_EXTRACTION_MODEL, temperature=0
+        ).with_structured_output(_TableRead)
+
+    # ------------------------------------------------------------------
+    # Night
+    # ------------------------------------------------------------------
+    def choose_night_target(self, view: AgentView) -> str:
+        candidates = self._night_candidates(view)
+        table_read = self._get_table_read(view)
+        question = {
+            Role.MAFIA: (
+                "Night falls. Who do you eliminate?\n"
+                "Think about who is most dangerous to your team right now: Has anyone claimed "
+                "to be the Detective or revealed an investigation result? They are your top "
+                "priority -- kill them first. If not, who has been asking the sharpest "
+                "questions or building momentum the Town might follow? Who has been quiet but "
+                "tracking everything -- a silent observer with a good read is more dangerous "
+                "than a loud one who telegraphs their reasoning. Pick the person whose silence "
+                "tomorrow costs the Town the most.\n"
+                "You cannot target your own teammates."
+            ),
+            Role.DOCTOR: (
+                "Night falls. Who do you protect?\n"
+                "The Mafia kills whoever is closest to exposing them. Think: has anyone "
+                "publicly claimed to be the Detective? If so, protect them -- that is almost "
+                "certainly tonight's target. Otherwise, who has been leading the accusation, "
+                "asking the sharpest questions, or building real momentum? Protect whoever "
+                "made the most progress today; the Mafia wants them silenced. Protect yourself "
+                "only if you genuinely believe you are the target tonight."
+            ),
+            Role.DETECTIVE: (
+                "Night falls. You investigate one player and get back a confirmed Town or Mafia.\n"
+                "Don't waste this on someone you've already written off. Think about your "
+                "biggest open question: Who has claimed a role you can't verify? Who has been "
+                "defending the most suspicious player -- a defender of the guilty is often "
+                "their partner. Who has been suspiciously quiet at exactly the moments a Town "
+                "player would have spoken up? Whoever you investigate tonight is confirmed or "
+                "cleared -- choose the name that resolves the most."
+            ),
+        }[view.role]
+
+        try:
+            response = self._night_llm[view.role].invoke(self._messages(view, question, table_read))
+        except Exception as exc:
+            self._warn(f"night-action call failed ({exc!r}); choosing at random")
+            return self._rng.choice(candidates)
+
+        if not response.tool_calls:
+            return self._rng.choice(candidates)
+        tc = response.tool_calls[0]["args"]
+        self._remember(view, tc.get("reasoning", ""))
+        return self._match_name(tc.get("target", ""), candidates) or self._rng.choice(candidates)
+
+    def _night_candidates(self, view: AgentView) -> list[str]:
+        others = list(view.others_alive)
+        if view.role is Role.MAFIA:
+            return [n for n in others if n not in view.teammates] or others
+        if view.role is Role.DOCTOR:
+            return [view.self_name, *others]
+        return others  # Detective
+
+    # ------------------------------------------------------------------
+    # Voting
+    # ------------------------------------------------------------------
+    def choose_vote(self, view: AgentView) -> str | None:
+        others = list(view.others_alive)
+        if not others:
+            return None
+
+        table_read = self._get_table_read(view)
+        if table_read.under_suspicion:
+            pressure_str = "\n".join(f"  - {p.name}: {p.note}" for p in table_read.under_suspicion)
+        else:
+            pressure_str = "  (no one stood out as a clear accusation target today)"
+        question = (
+            f"Time to vote. Here's a contextual read of today's discussion:\n{pressure_str}\n\n"
+            "This is real signal -- the room built it over this whole day phase. "
+            "Don't throw it away. Vote for the player the discussion actually pointed at most "
+            "strongly, unless you have a specific reason to believe that momentum was manufactured.\n\n"
+            "That said, don't ONLY follow the read above: Who has been deflecting instead of asking? "
+            "Who defended an accused player faster than the evidence warranted? "
+            "Whose read keeps conveniently shifting? "
+            "If you have no real signal at all, abstaining beats killing a townie -- "
+            "but be honest about whether that's caution or avoidance."
+        )
+        try:
+            response = self._vote_llm.invoke(self._messages(view, question, table_read))
+        except Exception as exc:
+            self._warn(f"vote call failed ({exc!r}); abstaining")
+            return None
+
+        if not response.tool_calls:
+            return None
+        tc = response.tool_calls[0]
+        self._remember(view, tc["args"].get("reasoning", ""))
+        if tc["name"] == "_AbstainTool":
+            return None
+        return self._match_name(tc["args"].get("target", ""), others)
+
+    # ------------------------------------------------------------------
+    # Discussion
+    # ------------------------------------------------------------------
+    def discussion_turn(self, view: AgentView) -> CommRequest | None:
+        # Who can actually hear you -- at night that's only your fellow Mafia (or
+        # no one, for the Doctor/Detective acting alone), never the sleeping table.
+        # Naming a sleeping player as a recipient is a protocol violation the bus
+        # rejects outright, so the candidate pool must mirror presence, not life.
+        others = [n for n in view.present if n != view.self_name]
+        if not others:
+            return None
+
+        table_read = self._get_table_read(view)
+
+        if view.phase is Phase.NIGHT:
+            killable = [n for n in view.others_alive if n not in view.teammates]
+            agreed_target = self._match_name(table_read.agreed_night_target, killable)
+            if agreed_target:
+                question = (
+                    f"Your team has already agreed to eliminate {agreed_target} tonight -- "
+                    "the decision is made, repeating it adds nothing. "
+                    "If you speak now, spend it on something useful: your cover story for tomorrow, "
+                    "who to redirect suspicion onto, what to watch for in the morning discussion, "
+                    "or who the next target should be. "
+                    "If there's nothing new to say, stay silent (speak=false) -- "
+                    "a quiet night is better than confirming the same name a fifth time."
+                )
+            else:
+                question = (
+                    "This is your private huddle with your fellow Mafia, before each of you separately "
+                    "names tonight's target -- no one else at the table can hear a word of it, however "
+                    "you choose to phrase it. This is your one chance all night to actually talk: settle "
+                    f"on who you're taking out and why -- the only people left to take out are "
+                    f"{', '.join(killable)}, so don't waste the huddle floating a name that's already an "
+                    "empty chair -- trade reads on who's getting close to the truth, line up your cover "
+                    "story for the morning, or warn each other what to watch for. Passing here means "
+                    "walking in tomorrow with no plan and no story straight -- decide whether that's "
+                    "really the move, and if you do speak, choose your channel on purpose."
+                )
+        else:
+            question = (
+                "Your turn. What's your move?\n"
+                "Remember: information you don't have yet is working against you. The most "
+                "valuable thing you can do right now might be asking, not telling -- a "
+                "question puts someone on record and forces a reaction. Name someone's "
+                "silence. Press a claim that hasn't been verified. Whisper to one person "
+                "to test a read before committing publicly.\n"
+                "If you speak: keep it short, in your own voice, choose your channel on "
+                "purpose. If you'd rather observe this round, passing is also a real move."
+            )
+        try:
+            response = self._discussion_llm.invoke(self._messages(view, question, table_read))
+        except Exception as exc:
+            self._warn(f"discussion call failed ({exc!r}); staying silent")
+            return None
+
+        if not response.tool_calls:
+            return None  # model chose not to act this turn
+
+        tc = response.tool_calls[0]
+        self._remember(view, tc["args"].get("reasoning", ""))
+
+        name = tc["name"]
+
+        if name == "_PassTurnTool":
+            return None
+
+        content = tc["args"].get("content", "").strip()
+        if not content:
+            return None
+
+        if name == "_BroadcastTool":
+            cast, to = CastType.BROADCAST, ()
+
+        elif name == "_WhisperTool":
+            recipient = self._match_name(tc["args"].get("recipient", ""), others)
+            if not recipient:
+                recipient = self._rng.choice(others)
+            cast, to = CastType.UNICAST, (recipient,)
+
+        elif name == "_HuddleTool":
+            raw = tc["args"].get("recipients", [])
+            matched: list[str] = []
+            for r in raw:
+                m = self._match_name(r, others)
+                if m and m not in matched:
+                    matched.append(m)
+            # Need at least 2 for a valid multicast; pad from remaining if short
+            if len(matched) < 2:
+                pool = [n for n in others if n not in matched]
+                self._rng.shuffle(pool)
+                matched.extend(pool[: 2 - len(matched)])
+            if len(matched) < 2:
+                cast, to = CastType.BROADCAST, ()
+            else:
+                cast, to = CastType.MULTICAST, tuple(matched)
+
+        else:
+            return None  # unknown tool -- stay silent
+
+        phase_key = f"{view.day_number}:{view.phase.value}"
+        self._phase_transcript.setdefault(phase_key, []).append(content)
+        return CommRequest(cast, to, content)
+
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
+    def _messages(self, view: AgentView, question: str, table_read: _TableRead) -> list:
+        return [
+            SystemMessage(content=self._system_prompt(view)),
+            HumanMessage(content=self._situation(view, question, table_read)),
+        ]
+
+    def _system_prompt(self, view: AgentView) -> str:
+        lines = [
+            f"You are {view.self_name}, a player at the table in a game of Mafia (a.k.a. Werewolf), "
+            "and your survival -- or your team's win -- genuinely depends on how you play this.",
+            "",
+            _ROLE_BRIEFS[view.role],
+        ]
+        if view.teammates:
+            lines.append(f"Your fellow Mafia (you know each other on sight): {', '.join(view.teammates)}.")
+        lines += [
+            "",
+            _PROTOCOL_BRIEF,
+            "",
+            _INTEL_BRIEF,
+            "",
+            _VOICE_BRIEF,
+        ]
+        if self._persona:
+            lines += [
+                "",
+                f"WHO YOU ARE AT THIS TABLE -- this is the specific person you are, "
+                f"distinct from your role and your goals.  Every word out of your mouth "
+                f"must sound like this character, not a generic Mafia player: {self._persona}",
+            ]
+        lines += [
+            "",
+            "Stay in character at all times, and always name players exactly as given to "
+            "you -- never invent, alter, or guess at a name.",
+        ]
+        return "\n".join(lines)
+
+    def _situation(self, view: AgentView, question: str, table_read: _TableRead) -> str:
+        lines = [
+            f"Day {view.day_number} -- {view.phase.value} phase.",
+            f"Still at the table, breathing: {', '.join(view.alive)}.",
+        ]
+        awake_with_you = [n for n in view.present if n != view.self_name]
+        if view.phase is Phase.NIGHT:
+            if awake_with_you:
+                lines.append(
+                    f"It's the dead of night -- everyone except you and {', '.join(awake_with_you)} "
+                    "is asleep and perceiving nothing right now. Whatever you say in this room, in "
+                    "whatever channel, reaches only the two (or few) of you who are actually awake -- "
+                    "NOT the wider table. This is your one private window to plan tonight together."
+                )
+            else:
+                lines.append(
+                    "It's the dead of night -- everyone else at the table is asleep and perceiving "
+                    "nothing. You're awake and alone with this choice; there's no one to talk to and "
+                    "no one listening, however you might phrase it."
+                )
+        if view.dead:
+            lines.append("Empty chairs -- gone, and everyone here knows it:")
+            for record in view.dead:
+                if record.revealed_role:
+                    lines.append(
+                        f"  - {record.name}: {record.cause} (Day {record.day_number}) -- "
+                        f"unmasked on the spot as the {record.revealed_role}"
+                    )
+                else:
+                    lines.append(
+                        f"  - {record.name}: {record.cause} (Day {record.day_number}) -- "
+                        "no one knows what they really were, and that's its own kind of haunting"
+                    )
+        if view.known_factions:
+            known = ", ".join(f"{name} is {faction.value}" for name, faction in view.known_factions.items())
+            lines.append(f"What you privately know, and only you know: {known}.")
+
+        huddles = self._active_huddles(view)
+        if huddles:
+            lines.append("")
+            lines.append("Side conversations you can see are underway RIGHT NOW -- you may not catch")
+            lines.append("the words, but no one slips off with someone else unnoticed at this table:")
+            lines.extend(f"  - {' and '.join(group)} are off in their own exchange" for group in huddles)
+
+        if (
+            table_read.under_suspicion
+            or table_read.defended
+            or table_read.role_claims
+            or table_read.contradictions
+        ):
+            lines.append("")
+            lines.append("Table read -- a contextual reading of the conversation so far:")
+            for p in table_read.under_suspicion:
+                lines.append(f"  - SUSPICION: {p.name} -- {p.note}")
+            for p in table_read.defended:
+                lines.append(f"  - DEFENDED: {p.name} -- {p.note}")
+            for p in table_read.role_claims:
+                lines.append(f"  - ROLE CLAIM: {p.name} -- {p.note}")
+            for c in table_read.contradictions:
+                lines.append(f"  - CONTRADICTION: {c}")
+
+        if view.phase is Phase.DAY:
+            silent = self._silent_players(view)
+            if silent:
+                lines.append("")
+                lines.append(f"Has not said a word this phase: {', '.join(silent)}")
+
+        if self._memory:
+            lines.append("")
+            lines.append(
+                "Your own running notes -- your private read on people and events, building "
+                "as the game goes (lean on these; don't start from zero each time):"
+            )
+            lines.extend(f"  - {note}" for note in self._memory[-_MEMORY_LIMIT:])
+
+        phase_key = f"{view.day_number}:{view.phase.value}"
+        own_msgs = self._phase_transcript.get(phase_key, [])
+        if own_msgs:
+            lines.append("")
+            lines.append(
+                "What YOU have already said this phase -- each of these has been heard. "
+                "Do NOT repeat or rephrase any of them. If you'd say the same thing again, "
+                "stay silent instead (speak=false). Say something new or say nothing:"
+            )
+            lines.extend(f"  - \"{msg}\"" for msg in own_msgs[-6:])
+
+        lines.append("")
+        lines.append("The conversation so far, exactly as you've experienced it:")
+        feed = list(view.feed)
+        if len(feed) > _FEED_WINDOW:
+            lines.append(f"  ... ({len(feed) - _FEED_WINDOW} earlier messages omitted) ...")
+            feed = feed[-_FEED_WINDOW:]
+        if feed:
+            lines.extend(f"  {sighting.render()}" for sighting in feed)
+        else:
+            lines.append("  (nothing yet)")
+
+        lines += ["", question]
+        return "\n".join(lines)
+
+    def _silent_players(self, view: AgentView) -> list[str]:
+        """Players present this phase who haven't sent anything you could perceive yet.
+
+        Purely structural -- based on who has a sighting in this phase, not on
+        what anyone said -- so it stays accurate regardless of phrasing.
+        """
+        speakers: set[str] = set()
+        for sighting in view.feed:
+            if sighting.day_number == view.day_number and sighting.phase_label == view.phase.value:
+                speakers.add(sighting.sender)
+        present_others = [n for n in view.present if n != view.self_name]
+        return [n for n in present_others if n not in speakers]
+
+    def _get_table_read(self, view: AgentView) -> _TableRead:
+        """A cheap, contextual read of the conversation so far -- replaces keyword scanning."""
+        if not view.feed:
+            return _TableRead()
+        try:
+            result = self._table_read_llm.invoke(self._table_read_prompt(view))
+        except Exception as exc:
+            self._warn(f"table-read call failed ({exc!r}); skipping contextual signals")
+            return _TableRead()
+        return result if isinstance(result, _TableRead) else _TableRead()
+
+    def _table_read_prompt(self, view: AgentView) -> list:
+        lines = [
+            "You are an impartial observer analyzing the table talk in a game of Mafia (Werewolf), "
+            f"from the point of view of what the player {view.self_name} has personally seen or heard.",
+            f"Players still at the table: {', '.join(view.alive)}.",
+        ]
+        if view.phase is Phase.NIGHT and view.teammates:
+            lines.append(
+                f"This is a private Mafia night huddle. {view.self_name}'s fellow Mafia: "
+                f"{', '.join(view.teammates)}."
+            )
+        lines.append("")
+        lines.append("Conversation, oldest first:")
+        feed = list(view.feed)
+        if len(feed) > _FEED_WINDOW:
+            feed = feed[-_FEED_WINDOW:]
+        if feed:
+            lines.extend(f"  {sighting.render()}" for sighting in feed)
+        else:
+            lines.append("  (nothing yet)")
+        lines.append("")
+        lines.append(
+            "Read this carefully and report what's ACTUALLY going on -- not which words were used. "
+            "A sentence that defends, clears, or vouches for someone is the OPPOSITE of an "
+            "accusation against them, even if it contains words like 'suspicious' or 'mafia'. "
+            "Only report a Mafia night-kill agreement if the team has clearly converged on one "
+            "name; arguing against a name is not agreement on it."
+        )
+        return [HumanMessage(content="\n".join(lines))]
+
+    def _active_huddles(self, view: AgentView) -> list[tuple[str, ...]]:
+        """Side conversations visibly underway right now, as the room would see them.
+
+        A bystander can't hear a private exchange, but they can always see its
+        SHAPE -- who leaned in with whom, just now, in this same phase. Walking
+        the feed newest-first and "claiming" each name into the first (i.e. most
+        recent) group it appears in gives a clean snapshot of where everyone last
+        stepped away to -- exactly what you'd want to know before pulling someone
+        aside who may already be mid-huddle with someone else.
+        """
+        claimed: set[str] = set()
+        huddles: list[tuple[str, ...]] = []
+        for sighting in reversed(view.feed):
+            participants = {sighting.sender, *sighting.to}
+            if (
+                sighting.cast is CastType.BROADCAST
+                or view.self_name in participants
+                or sighting.day_number != view.day_number
+                or sighting.phase_label != view.phase.value
+            ):
+                continue
+            group = tuple(sorted(participants))
+            if len(group) < 2 or claimed & set(group):
+                continue
+            claimed.update(group)
+            huddles.append(group)
+        return huddles
+
+    def _remember(self, view: AgentView, note: str) -> None:
+        """File this turn's private reasoning away as a note-to-self for later turns.
+
+        This is what gives an agent continuity of suspicion -- a read formed on
+        Day 1 ("Drew dodged my question") can resurface and harden by Day 3
+        ("...and now Drew's pushing hard to lynch the one person backing me up")
+        instead of being silently re-derived, or lost, each time it's asked to act.
+        """
+        note = note.strip()
+        if note:
+            self._memory.append(f"({view.phase.value} {view.day_number}) {note}")
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _match_name(raw: str | None, candidates: list[str]) -> str | None:
+        if not raw:
+            return None
+        cleaned = raw.strip().lower()
+        for name in candidates:
+            if name.lower() == cleaned:
+                return name
+        for name in candidates:
+            if name.lower() in cleaned or cleaned in name.lower():
+                return name
+        return None
+
+    def _warn(self, message: str) -> None:
+        print(f"  [{self.name}] {message}")
+
+
+
+================================================
+FILE: mafia_sim/protocol/__init__.py
+================================================
+"""The custom A2A (agent-to-agent) communication protocol.
+
+Models how humans actually talk at a table: whoever is speaking picks, in the
+moment, whether to address the whole room (`broadcast`), pull a few people
+into a side huddle (`multicast`), or lean over and whisper to one neighbour
+(`unicast`). Capability mirrors *presence* -- only agents who are "in the
+room" right now can send or perceive anything -- and is otherwise completely
+agent-agnostic: any agent (rule-based, LLM-backed, human, or otherwise) that
+can produce a `CommRequest` can use it.
+
+    from mafia_sim.protocol import CastType, CommBus, CommRequest
+
+This package is the sole owner of the routing rules; `bus.py` documents them.
+"""
+
+from .bus import CommBus, ProtocolError
+from .casting import CastType
+from .messages import CommRequest, Message, Sighting
+
+__all__ = [
+    "CastType",
+    "CommBus",
+    "CommRequest",
+    "Message",
+    "ProtocolError",
+    "Sighting",
+]
+
+
+
+================================================
+FILE: mafia_sim/protocol/bus.py
+================================================
+"""The router at the heart of the A2A protocol.
+
+`CommBus` is intentionally the *only* place that knows how to turn a raw
+`CommRequest` into delivered `Sighting`s. It is completely agent-agnostic --
+it has no notion of roles, factions, or game rules, only of who is currently
+"present" (able to send and perceive at all) and who a message is addressed
+to. That is what lets any kind of agent (rule-based, LLM-backed, human, or
+something not yet imagined) share the exact same channel.
+
+Pacing is a single global sequence counter stamped at submission time. That's
+the entire "queue": ordering only matters where two messages land in the same
+inbox, and a monotonic sequence number resolves that for free while costing
+nothing where recipient sets never overlap.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+from .casting import CastType
+from .messages import CommRequest, Message, Sighting
+
+
+class ProtocolError(ValueError):
+    """Raised when a requested message violates the A2A protocol's rules."""
+
+
+class CommBus:
+    """Routes A2A messages and builds both the spectator log and per-agent feeds."""
+
+    def __init__(self) -> None:
+        self._counter = itertools.count(1)
+        self.spectator_log: list[Message] = []
+        self._feeds: dict[str, list[Sighting]] = {}
+
+    def feed_for(self, name: str) -> list[Sighting]:
+        return self._feeds.setdefault(name, [])
+
+    def send(
+        self,
+        sender: str,
+        request: CommRequest,
+        *,
+        present: tuple[str, ...],
+        day_number: int,
+        phase_label: str,
+    ) -> Message:
+        """Validate, route, and log one message. Returns the canonical record."""
+        if sender not in present:
+            raise ProtocolError(f"{sender} is not present right now and cannot speak")
+
+        recipients = self._resolve_recipients(sender, request, present)
+
+        seq = next(self._counter)
+        message = Message(seq, sender, request.cast, recipients, request.content, day_number, phase_label)
+        self.spectator_log.append(message)
+
+        party = {sender, *recipients}
+        for name in present:
+            self.feed_for(name).append(
+                Sighting(
+                    seq=seq,
+                    sender=sender,
+                    cast=request.cast,
+                    to=recipients,
+                    content=request.content if name in party else None,
+                    day_number=day_number,
+                    phase_label=phase_label,
+                )
+            )
+
+        return message
+
+    @staticmethod
+    def _resolve_recipients(sender: str, request: CommRequest, present: tuple[str, ...]) -> tuple[str, ...]:
+        if request.cast is CastType.BROADCAST:
+            if request.to:
+                raise ProtocolError("broadcast addresses the whole room -- it takes no explicit recipients")
+            return tuple(p for p in present if p != sender)
+
+        recipients = tuple(dict.fromkeys(request.to))  # de-dupe, keep order
+        if not recipients:
+            raise ProtocolError(f"{request.cast.value} requires at least one named recipient")
+        if sender in recipients:
+            raise ProtocolError(f"{sender} cannot address themselves")
+        if request.cast is CastType.UNICAST and len(recipients) != 1:
+            raise ProtocolError("unicast must name exactly one recipient")
+        if request.cast is CastType.MULTICAST and len(recipients) < 2:
+            raise ProtocolError("multicast must name at least two recipients (use unicast for one)")
+        for name in recipients:
+            if name not in present:
+                raise ProtocolError(f"{name} is not present right now and cannot be addressed")
+        return recipients
+
+
+
+================================================
+FILE: mafia_sim/protocol/casting.py
+================================================
+"""The three ways an agent can address the table."""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class CastType(Enum):
+    UNICAST = "unicast"
+    MULTICAST = "multicast"
+    BROADCAST = "broadcast"
+
+    @property
+    def shorthand(self) -> str:
+        return _SHORTHAND[self]
+
+
+_SHORTHAND = {
+    CastType.UNICAST: "uni",
+    CastType.MULTICAST: "multi",
+    CastType.BROADCAST: "broad",
+}
+
+
+
+================================================
+FILE: mafia_sim/protocol/messages.py
+================================================
+"""The data shapes that flow through the A2A protocol.
+
+`CommRequest` is what an agent *hands the bus* when it decides to speak.
+`Message` is the canonical, full-content record kept in the omniscient
+spectator log. `Sighting` is what one agent actually *perceives* -- full
+content if they were a party to it, or just its shape (who, how broad, to
+whom) if they merely witnessed it pass between others.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .casting import CastType
+
+
+@dataclass(frozen=True)
+class CommRequest:
+    """What an agent hands the bus when it decides to speak."""
+    cast: CastType
+    to: tuple[str, ...]
+    content: str
+
+
+@dataclass(frozen=True)
+class Message:
+    """An entry in the omniscient spectator log -- full content, always."""
+    seq: int
+    sender: str
+    cast: CastType
+    to: tuple[str, ...]
+    content: str
+    day_number: int
+    phase_label: str
+
+    def shape(self) -> str:
+        return f"{self.sender} -> {self.cast.shorthand}: {','.join(self.to)}"
+
+    def __str__(self) -> str:
+        return f"[{self.phase_label} {self.day_number}] {self.shape()} :: {self.content}"
+
+
+@dataclass(frozen=True)
+class Sighting:
+    """An entry in one agent's personal feed.
+
+    `content` is None when the agent merely witnessed the message pass
+    between others -- they perceive its *shape* (who, how broad, to whom)
+    but not what was said, just like overhearing a huddle across the table.
+    """
+    seq: int
+    sender: str
+    cast: CastType
+    to: tuple[str, ...]
+    content: str | None
+    day_number: int
+    phase_label: str
+
+    @property
+    def is_content_known(self) -> bool:
+        return self.content is not None
+
+    def render(self) -> str:
+        targets = ",".join(self.to)
+        header = f"[{self.phase_label} {self.day_number}] {self.sender} ({self.cast.shorthand} -> {targets})"
+        if self.content is not None:
+            return f"{header}: {self.content}"
+        return f"{header} -- (you only see that this happened, not what was said)"
+
+
+
+================================================
+FILE: server/__init__.py
+================================================
+"""FastAPI app that streams live Mafia games to a frontend over a WebSocket."""
+
+from .app import app
+
+__all__ = ["app"]
+
+
+
+================================================
+FILE: server/app.py
+================================================
+"""FastAPI app that streams the one shared, scheduled Mafia game to everyone.
+
+A fresh table of seven LLM-backed agents sits down every hour, on the hour,
+played out on a single background loop (`director.direct_games`) -- there is
+never more than one `Simulation` running. Every WebSocket connection simply
+subscribes to the shared `GameHub`: it's handed a snapshot to catch up on
+instantly (the live game's events so far, or the last completed game's full
+transcript if the table's empty right now) and then a live feed of whatever
+the hub broadcasts next, frame by frame, as the same JSON-serializable
+`GameEvent`s `spectate.py` renders to a console. Nobody has to wait for a
+fresh game to start to see what's going on at the table.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager, suppress
+from typing import Literal
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+from .director import direct_games
+from .hub import ErrorUpdate, GameHub, StatusUpdate
+
+logger = logging.getLogger("mafia.server")
+
+hub = GameHub()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not os.environ.get("OPENAI_API_KEY"):
+        logger.warning("OPENAI_API_KEY is not set -- the scheduled LLM games will fail to play")
+
+    task = asyncio.create_task(direct_games(hub))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(
+    title="Mafia Simulator",
+    description="Streams the one shared, hourly agent-vs-agent Mafia game over a WebSocket -- live, or caught up.",
+    lifespan=lifespan,
+)
+
+
+class _StatusFrame(BaseModel):
+    type: Literal["status"] = "status"
+    mode: Literal["idle", "live", "replay"]
+    next_game_at: str | None = None
+
+
+def _status_frame(update: StatusUpdate) -> dict:
+    return _StatusFrame(
+        mode=update.mode,
+        next_game_at=update.next_game_at.isoformat() if update.next_game_at else None,
+    ).model_dump(mode="json")
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "info": "Open a WebSocket on /ws/game to watch the shared Mafia game -- live, or caught up on the last one.",
+    }
+
+
+@app.get("/game/roles")
+def roles() -> dict[str, dict[str, str] | None]:
+    """Reveal who is who at the table currently (or most recently) seated.
+
+    The WebSocket stream only ever reveals a seat's role when the *table itself*
+    learns it -- a lynch unmasks the victim, the final `game_ended` unmasks
+    everyone. This endpoint is the deliberate exception: an out-of-band peek
+    behind the curtain, available from the moment a table sits down, for a
+    spectator UI that wants to offer one (a "reveal seats" toggle, a who's-who
+    legend, face-down cards a viewer can choose to flip, ...).
+
+    Returns `{"roles": {"Avery": "Mafia", ...}}`, or `{"roles": null}` before
+    the very first table has ever been seated.
+    """
+    return {"roles": hub.roles}
+
+
+@app.websocket("/ws/game")
+async def stream_game(websocket: WebSocket) -> None:
+    """Tune in to the one shared game, frame by frame, the moment you connect.
+
+    No configuration message -- there's nothing to configure. The server
+    starts streaming immediately. The very first frame is always
+
+        {"type": "status", "mode": "idle" | "live" | "replay", "next_game_at": "<ISO8601>" | null}
+
+    - `"live"`   -- a game is in progress. You're instantly caught up on
+                    everything that's happened so far, then watch the rest
+                    play out live.
+    - `"replay"` -- the table's empty right now. What follows is the last
+                    completed game's full transcript, then live coverage of
+                    the next one once `next_game_at` arrives.
+    - `"idle"`   -- the very first game hasn't started yet. Just wait for
+                    `next_game_at`.
+
+    After that, every frame is the `model_dump(mode="json")` of one
+    `GameEvent` from `mafia_sim.events` (`game_started`, `phase_started`,
+    `table_talk`, `night_resolved`, `day_resolved`, `game_ended`), in the
+    exact order the game produced them -- interleaved with further `status`
+    frames whenever the schedule changes, and `{"type": "error", "message":
+    "..."}` if a game hits trouble mid-stream. The connection stays open
+    across games, so you can simply leave it running; disconnect whenever
+    you like.
+    """
+    await websocket.accept()
+    snapshot, queue = hub.subscribe()
+
+    try:
+        await websocket.send_json(
+            _status_frame(StatusUpdate(mode=snapshot.mode, next_game_at=snapshot.next_game_at))
+        )
+        for event in snapshot.events:
+            await websocket.send_json(event.model_dump(mode="json"))
+
+        while True:
+            item = await queue.get()
+            if isinstance(item, StatusUpdate):
+                await websocket.send_json(_status_frame(item))
+            elif isinstance(item, ErrorUpdate):
+                await websocket.send_json({"type": "error", "message": item.message})
+            else:
+                await websocket.send_json(item.model_dump(mode="json"))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.unsubscribe(queue)
+        with suppress(RuntimeError):
+            await websocket.close()
+
+
+
+================================================
+FILE: server/director.py
+================================================
+"""Runs exactly one Mafia game an hour, on the hour, broadcasting it live.
+
+`direct_games` is the long-running loop started at app startup: it sleeps
+until the next hour boundary, plays one game off the event loop (LLM calls
+block), and feeds its `GameEvent`s straight to the shared `GameHub` as they
+happen -- then loops. Whatever the hub had on display before simply becomes
+the new "last game" the moment this one ends, ready to replay for the next
+viewer who tunes in between rounds.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from mafia_sim import PERSONAS, Agent, LLMAgent, Simulation
+from mafia_sim.events import GameEvent
+
+from .hub import GameHub
+
+logger = logging.getLogger("mafia.director")
+
+# Boundaries are picked on the hour in IST (the table's home timezone),
+# so the schedule reads as a clean run of x:00s.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+# The fixed table everyone tunes in to see -- no viewer ever configures this.
+PLAYER_NAMES = [
+    "Avery", "Bailey", "Casey", "Drew", "Ellis",
+    "Frankie", "Harper", "Jordan", "Kai", "Logan",
+]
+NUM_MAFIA = 2
+MODEL = "gpt-4.1-mini"
+
+# Sentinel placed on the bridge queue once the worker thread has nothing left to send.
+_DONE = object()
+
+
+@dataclass(frozen=True)
+class _RolesRevealed:
+    """Bridge-only marker: the freshly-seated table's true seat -> role mapping.
+
+    Not a `GameEvent` -- it never goes out over the WebSocket, where roles stay
+    secret until the table itself reveals them. It exists purely to hand the
+    hub what `/game/roles` needs, the moment the table is seated.
+    """
+
+    roles: dict[str, str]
+
+
+def _next_hour_boundary(now: datetime | None = None) -> datetime:
+    """Next X:00 mark in IST -- the table's regular curtain time."""
+    now = (now or datetime.now(timezone.utc)).astimezone(_IST)
+    boundary = now.replace(minute=0, second=0, microsecond=0)
+    if boundary <= now:
+        boundary += timedelta(hours=1)
+    return boundary.astimezone(timezone.utc)
+
+
+def _build_agents(seed: int) -> list[Agent]:
+    """Seat the table -- each player gets the same brain, a private rng, and one
+    of the fifteen `PERSONAS` dealt out at random so the room sounds like a
+    different group of people from game to game (never repeats a seat -- ten
+    players, fifteen personas, no two voices the same on a given night)."""
+    personas = random.Random(seed).sample(PERSONAS, len(PLAYER_NAMES))
+    return [
+        LLMAgent(name, model=MODEL, persona=persona, rng=random.Random(hash((name, seed)) & 0xFFFF))
+        for name, persona in zip(PLAYER_NAMES, personas)
+    ]
+
+
+def _play_in_background(seed: int, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
+    """Plays one whole game on a worker thread, relaying each event onto `loop`.
+
+    Off the event loop because LLM-backed agents make blocking network calls
+    -- the same bridge `server.app` used to run per-connection, just feeding
+    the shared hub instead of one client's socket.
+    """
+
+    def relay(item: object) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    try:
+        agents = _build_agents(seed)
+        sim = Simulation(agents, num_mafia=NUM_MAFIA, rng_seed=seed)
+        events = sim.run()
+        first = next(events)        # game_started -- the engine has now seated and assigned roles
+        relay(first)
+        relay(_RolesRevealed(sim.roles))
+        for event in events:
+            relay(event)
+    except Exception as exc:  # noqa: BLE001 -- surfaced to viewers, not swallowed
+        relay(exc)
+    finally:
+        relay(_DONE)
+
+
+async def _run_one_game(hub: GameHub) -> None:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    seed = random.randrange(1_000_000)
+    threading.Thread(target=_play_in_background, args=(seed, loop, queue), daemon=True).start()
+
+    while True:
+        item = await queue.get()
+        if item is _DONE:
+            return
+        if isinstance(item, _RolesRevealed):
+            hub.set_roles(item.roles)
+            continue
+        if isinstance(item, Exception):
+            logger.error("scheduled game ended in error: %s", item)
+            hub.report_error(str(item))
+            return
+        event: GameEvent = item
+        hub.publish(event)
+
+
+async def direct_games(hub: GameHub) -> None:
+    """The hourly heartbeat: announce, sleep, play, broadcast, repeat -- forever."""
+    next_at = _next_hour_boundary()
+    hub.schedule(next_at)
+
+    while True:
+        delay = (next_at - datetime.now(timezone.utc)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        hub.start_game()
+        try:
+            await _run_one_game(hub)
+        except Exception:  # noqa: BLE001 -- a bad game shouldn't kill the heartbeat
+            logger.exception("game director hit an unexpected error mid-game")
+
+        next_at = _next_hour_boundary()
+        hub.end_game(next_at)
+
+
+
+================================================
+FILE: server/hub.py
+================================================
+"""In-process broadcast hub for the one shared, scheduled Mafia game.
+
+Exactly one `Simulation` plays at a time, on a background loop
+(`director.direct_games`). Every viewer just subscribes here: each gets a
+snapshot to catch up on instantly -- the live game's events so far, or the
+last completed game's full transcript if nothing is running -- followed by a
+live feed of whatever the hub broadcasts next. That's what lets someone tune
+in mid-game and land in the middle of the action, or review the last game
+while waiting for the next one, without the backend ever running more than
+one simulation at once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal, Union
+
+from mafia_sim.events import GameEvent
+
+Mode = Literal["idle", "live", "replay"]
+
+
+@dataclass(frozen=True)
+class StatusUpdate:
+    """Broadcast on subscribe and whenever the hub's mode or schedule changes."""
+
+    mode: Mode
+    next_game_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ErrorUpdate:
+    """Broadcast when the live game hits trouble mid-stream."""
+
+    message: str
+
+
+@dataclass(frozen=True)
+class HubSnapshot:
+    """What a brand new subscriber needs to be caught up instantly."""
+
+    events: list[GameEvent]
+    mode: Mode
+    next_game_at: datetime | None
+
+
+BroadcastItem = Union[GameEvent, StatusUpdate, ErrorUpdate]
+
+
+class GameHub:
+    """Owns the current event log and fans it out to every subscriber.
+
+    Every method here is plain, synchronous code that only ever runs on the
+    asyncio event loop thread (the worker thread that actually plays a game
+    only ever reaches it through `loop.call_soon_threadsafe`, same as the
+    original per-connection bridge did). That means `subscribe` and
+    `publish` can never interleave -- a new subscriber's snapshot is exactly
+    "everything published before this call", and its queue is guaranteed to
+    receive everything published after, with nothing skipped or duplicated.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[GameEvent] = []
+        self._mode: Mode = "idle"
+        self._next_game_at: datetime | None = None
+        self._subscribers: set[asyncio.Queue[BroadcastItem]] = set()
+        self._roles: dict[str, str] | None = None
+
+    # ------------------------------------------------------------------
+    # Subscriber lifecycle
+    # ------------------------------------------------------------------
+    def subscribe(self) -> tuple[HubSnapshot, "asyncio.Queue[BroadcastItem]"]:
+        queue: asyncio.Queue[BroadcastItem] = asyncio.Queue()
+        snapshot = HubSnapshot(events=list(self._events), mode=self._mode, next_game_at=self._next_game_at)
+        self._subscribers.add(queue)
+        return snapshot, queue
+
+    def unsubscribe(self, queue: "asyncio.Queue[BroadcastItem]") -> None:
+        self._subscribers.discard(queue)
+
+    @property
+    def roles(self) -> dict[str, str] | None:
+        """Seat -> true role for the table currently (or most recently) seated.
+
+        Backs the `/game/roles` reveal endpoint -- a deliberate, out-of-band
+        peek behind the curtain for spectators who want one (a "reveal" toggle,
+        a who's-who overlay, ...), independent of and well ahead of whatever the
+        table itself has narratively figured out. `None` until the very first
+        table is seated.
+        """
+        return dict(self._roles) if self._roles is not None else None
+
+    def _broadcast(self, item: BroadcastItem) -> None:
+        for queue in self._subscribers:
+            queue.put_nowait(item)
+
+    def _broadcast_status(self) -> None:
+        self._broadcast(StatusUpdate(mode=self._mode, next_game_at=self._next_game_at))
+
+    # ------------------------------------------------------------------
+    # Director-driven transitions -- called only from `direct_games`
+    # ------------------------------------------------------------------
+    def schedule(self, next_game_at: datetime) -> None:
+        """Announce when the next game starts without changing what's on display."""
+        self._next_game_at = next_game_at
+        self._broadcast_status()
+
+    def start_game(self) -> None:
+        self._events = []
+        self._mode = "live"
+        self._next_game_at = None
+        self._broadcast_status()
+
+    def set_roles(self, roles: dict[str, str]) -> None:
+        """Record the freshly-seated table's seat -> role mapping for the reveal endpoint."""
+        self._roles = dict(roles)
+
+    def publish(self, event: GameEvent) -> None:
+        self._events.append(event)
+        self._broadcast(event)
+
+    def report_error(self, message: str) -> None:
+        self._broadcast(ErrorUpdate(message))
+
+    def end_game(self, next_game_at: datetime) -> None:
+        """The just-finished game's events stay put as the new "last game" --
+        whoever connects before the next one starts gets to replay them."""
+        self._mode = "replay"
+        self._next_game_at = next_game_at
+        self._broadcast_status()
+
+

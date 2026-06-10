@@ -21,6 +21,7 @@ a pass where nobody speaks ends the conversation.
 
 from __future__ import annotations
 
+import logging
 import random
 from collections import Counter
 from collections.abc import Iterator
@@ -36,11 +37,18 @@ from .events import (
     TableTalk,
     VoteCast,
 )
-from .protocol import CommBus, Message
+from .protocol import CommBus, Message, ProtocolError
 from .engine import GameEngine
 from .models import Faction, Phase, Role
 
-MAX_DISCUSSION_PASSES = 6
+logger = logging.getLogger("mafia.simulation")
+
+MAX_DISCUSSION_PASSES = 4
+
+# A seat that's already sent this many messages this phase sits out the rest
+# of it -- caps any one voice from dominating a discussion regardless of how
+# many passes it takes to wind down.
+MAX_MESSAGES_PER_PHASE = 3
 
 
 class Simulation:
@@ -51,6 +59,8 @@ class Simulation:
         self.bus = CommBus()
         self._knowledge: dict[str, dict[str, Faction]] = {a.name: {} for a in agents}
         self._dead: list[DeathRecord] = []
+        # day_number -> {voter: target_or_None}, filled in as votes are cast.
+        self._vote_history: dict[int, dict[str, str | None]] = {}
 
     @property
     def roles(self) -> dict[str, str]:
@@ -89,7 +99,11 @@ class Simulation:
     # ------------------------------------------------------------------
     def _run_night(self) -> Iterator[GameEvent]:
         mafia_present = tuple(p.name for p in self.engine.players_with_role(Role.MAFIA))
-        yield PhaseStarted(phase="Night", day_number=self.engine.day_number, present=list(mafia_present))
+        # `present` is left empty here -- naming the awake players would hand
+        # spectators the Mafia roster before the table itself ever learns it.
+        yield PhaseStarted(
+            phase="Night", day_number=self.engine.day_number, present=[], present_count=len(mafia_present)
+        )
 
         if len(mafia_present) > 1:
             yield from self._run_discussion(mafia_present, Phase.NIGHT.value)
@@ -122,7 +136,9 @@ class Simulation:
     # ------------------------------------------------------------------
     def _run_day(self) -> Iterator[GameEvent]:
         present = tuple(p.name for p in self.engine.alive_players)
-        yield PhaseStarted(phase="Day", day_number=self.engine.day_number, present=list(present))
+        yield PhaseStarted(
+            phase="Day", day_number=self.engine.day_number, present=list(present), present_count=len(present)
+        )
 
         yield from self._run_discussion(present, Phase.DAY.value)
         yield from self._run_vote(present)
@@ -153,10 +169,12 @@ class Simulation:
         order = list(present)
         self._rng.shuffle(order)
         tally: Counter[str] = Counter()
+        day_votes = self._vote_history.setdefault(self.engine.day_number, {})
         for name in order:
             view = self._build_view(name, present=present)
             target = self._agents[name].choose_vote(view)
             self.engine.submit_vote(name, target)
+            day_votes[name] = target
             if target is not None:
                 tally[target] += 1
             yield VoteCast(
@@ -181,23 +199,31 @@ class Simulation:
         min_speakers = max(1, len(present) // 4)
         had_active_pass = False
         stale_passes = 0
+        speaker_counts: Counter[str] = Counter()
         for _ in range(MAX_DISCUSSION_PASSES):
             self._rng.shuffle(order)
             speakers_this_pass = 0
             for name in order:
+                if speaker_counts[name] >= MAX_MESSAGES_PER_PHASE:
+                    continue
                 view = self._build_view(name, present=present)
                 request = self._agents[name].discussion_turn(view)
                 if request is None:
                     continue
-                message = self.bus.send(
-                    name,
-                    request,
-                    present=present,
-                    day_number=self.engine.day_number,
-                    phase_label=phase_label,
-                )
+                try:
+                    message = self.bus.send(
+                        name,
+                        request,
+                        present=present,
+                        day_number=self.engine.day_number,
+                        phase_label=phase_label,
+                    )
+                except ProtocolError as exc:
+                    logger.warning("dropped invalid message from %s: %s", name, exc)
+                    continue
+                speaker_counts[name] += 1
                 speakers_this_pass += 1
-                yield self._table_talk_event(message)
+                yield self._table_talk_event(message, room_size=len(present))
             if speakers_this_pass == 0:
                 break
             if speakers_this_pass >= min_speakers:
@@ -209,7 +235,7 @@ class Simulation:
                     break
 
     @staticmethod
-    def _table_talk_event(message: Message) -> TableTalk:
+    def _table_talk_event(message: Message, room_size: int) -> TableTalk:
         return TableTalk(
             seq=message.seq,
             sender=message.sender,
@@ -218,6 +244,7 @@ class Simulation:
             content=message.content,
             day_number=message.day_number,
             phase=message.phase_label,
+            room_size=room_size,
         )
 
     # ------------------------------------------------------------------
@@ -240,6 +267,7 @@ class Simulation:
             teammates=teammates,
             known_factions=dict(self._knowledge[name]),
             feed=tuple(self.bus.feed_for(name)),
+            vote_history=dict(self._vote_history),
         )
 
     def _seed_mafia_knowledge(self) -> None:

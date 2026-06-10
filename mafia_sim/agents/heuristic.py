@@ -377,6 +377,8 @@ class HeuristicAgent(Agent):
             if not sighting.is_content_known or sighting.sender == view.self_name:
                 continue
             text = sighting.content.lower()
+            if any(kw in text for kw in _DEFENSE_KEYWORDS):
+                continue
             if not any(kw in text for kw in _ACCUSATION_KEYWORDS):
                 continue
             is_today_day = (
@@ -412,7 +414,10 @@ class HeuristicAgent(Agent):
         for sighting in view.feed:
             if sighting.sender not in pool_set or not sighting.is_content_known:
                 continue
-            if any(kw in sighting.content.lower() for kw in threat_kw):
+            text = sighting.content.lower()
+            if any(kw in text for kw in _DEFENSE_KEYWORDS):
+                continue
+            if any(kw in text for kw in threat_kw):
                 tally[sighting.sender] += 1
         return tally
 
@@ -423,7 +428,10 @@ class HeuristicAgent(Agent):
         for sighting in view.feed:
             if sighting.sender not in pool_set or not sighting.is_content_known:
                 continue
-            if any(kw in sighting.content.lower() for kw in _ACCUSATION_KEYWORDS):
+            text = sighting.content.lower()
+            if any(kw in text for kw in _DEFENSE_KEYWORDS):
+                continue
+            if any(kw in text for kw in _ACCUSATION_KEYWORDS):
                 tally[sighting.sender] += 1
         return tally
 

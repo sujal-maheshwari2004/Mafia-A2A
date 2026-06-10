@@ -1,7 +1,7 @@
 """Watch a full agent-vs-agent game play out over the A2A protocol.
 
 Usage:
-    python spectate.py [num_players] [seed] [--brain heuristic|llm|mixed] [--model gpt-4o-mini]
+    python spectate.py [num_players] [seed] [--brain heuristic|llm|mixed] [--model gpt-4.1-mini]
 
 `heuristic` agents are free and need no setup. `llm` and `mixed` use
 LangChain + OpenAI and require OPENAI_API_KEY in your environment -- the
@@ -28,6 +28,7 @@ from mafia_sim import (
     Simulation,
     TableTalk,
     VoteCast,
+    stable_int_seed,
 )
 
 DEFAULT_NAMES = [
@@ -37,12 +38,12 @@ DEFAULT_NAMES = [
 
 
 def build_agent(brain: str, name: str, seed: int, model: str) -> Agent:
-    rng = random.Random(hash((name, seed)) & 0xFFFF)
+    rng = random.Random(stable_int_seed(name, seed))
     if brain == "llm":
         return LLMAgent(name, model=model, rng=rng)
     if brain == "mixed":
         # alternate so you can directly compare LLM vs. heuristic play in one game
-        return LLMAgent(name, model=model, rng=rng) if hash(name) % 2 else HeuristicAgent(name, rng=rng)
+        return LLMAgent(name, model=model, rng=rng) if stable_int_seed(name) % 2 else HeuristicAgent(name, rng=rng)
     return HeuristicAgent(name, rng=rng)
 
 
@@ -58,15 +59,15 @@ def render_event(event: GameEvent) -> None:
         case GameStarted():
             pass  # the roster is already printed up front, before the game starts
 
-        case PhaseStarted(phase="Night", day_number=day, present=present):
-            awake = ", ".join(present) if present else "no one (lone mafia already gone)"
-            print(f"\n--- Night {day}  (awake: {awake}) ---")
+        case PhaseStarted(phase="Night", day_number=day, present_count=count):
+            print(f"\n--- Night {day}  ({count} awake) ---")
         case PhaseStarted(phase="Day", day_number=day, present=present):
             print(f"\n--- Day {day}  (at the table: {', '.join(present)}) ---")
 
-        case TableTalk(sender=sender, cast=cast, to=to, content=content, day_number=day, phase=phase):
+        case TableTalk(sender=sender, cast=cast, to=to, content=content, day_number=day, phase=phase, room_size=room_size):
             shorthand = CastType(cast).shorthand
-            print(f"    [{phase} {day}] {sender} -> {shorthand}: {','.join(to)} :: {content}")
+            room_tag = f" [room of {room_size}]" if phase == "Night" else ""
+            print(f"    [{phase} {day}]{room_tag} {sender} -> {shorthand}: {','.join(to)} :: {content}")
 
         case VoteCast(voter=voter, target=target, tally_so_far=tally):
             cast = f"votes for {target}" if target else "abstains"
@@ -101,7 +102,7 @@ def main() -> None:
     parser.add_argument("count", nargs="?", type=int, default=7, help="number of players (5-10)")
     parser.add_argument("seed", nargs="?", type=int, default=None, help="RNG seed for a reproducible game")
     parser.add_argument("--brain", choices=["heuristic", "llm", "mixed"], default="heuristic")
-    parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model for llm/mixed agents")
+    parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model for llm/mixed agents")
     args = parser.parse_args()
 
     if args.brain in ("llm", "mixed") and not os.environ.get("OPENAI_API_KEY"):
