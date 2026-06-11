@@ -617,7 +617,11 @@ class LLMAgent(Agent):
             return [n for n in others if n not in view.teammates] or others
         if view.role is Role.DOCTOR:
             return [view.self_name, *others]
-        return others  # Detective
+        # Detective: prefer players not yet investigated -- re-checking a
+        # confirmed name wastes the night's only action. Fall back to
+        # everyone if there's no one left to learn anything new about.
+        unknown = [n for n in others if n not in view.known_factions]
+        return unknown or others
 
     # ------------------------------------------------------------------
     # Voting
@@ -707,9 +711,10 @@ class LLMAgent(Agent):
         else:
             phase_key = f"{view.day_number}:{view.phase.value}"
             recent_deaths = [r for r in view.dead if r.day_number >= view.day_number - 1]
+            had_recent_save = view.day_number in view.saved_nights
             is_first_turn = not self._phase_transcript.get(phase_key)
-            if is_first_turn and recent_deaths:
-                question = self._reaction_beat_question(recent_deaths)
+            if is_first_turn and (recent_deaths or had_recent_save):
+                question = self._reaction_beat_question(recent_deaths, had_recent_save)
             else:
                 question = (
                     "Your turn. What's your move?\n"
@@ -799,12 +804,17 @@ class LLMAgent(Agent):
         self._phase_transcript.setdefault(phase_key, []).append(content)
         return CommRequest(cast, to, content)
 
-    def _reaction_beat_question(self, recent_deaths: list[DeathRecord]) -> str:
+    def _reaction_beat_question(self, recent_deaths: list[DeathRecord], had_recent_save: bool) -> str:
         parts = [
             f"{r.name} ({r.cause}, revealed as {r.revealed_role})" if r.revealed_role
             else f"{r.name} ({r.cause})"
             for r in recent_deaths
         ]
+        if had_recent_save:
+            parts.append(
+                "someone was attacked in the night and survived -- word is the doctor "
+                "got there in time, but no one knows who"
+            )
         return (
             f"REACT FIRST. {', '.join(parts)} -- this just landed, and it's still "
             "raw. Before you pivot to strategy or accusations, let the news "
@@ -893,6 +903,11 @@ class LLMAgent(Agent):
                         f"  - {record.name}: {record.cause} (Day {record.day_number}) -- "
                         "no one knows what they really were, and that's its own kind of haunting"
                     )
+        if view.day_number in view.saved_nights:
+            lines.append(
+                "Word this morning: someone was attacked in the night and is still breathing -- "
+                "the doctor must have gotten to them in time. No one knows who it was."
+            )
         if view.known_factions:
             known = ", ".join(f"{name} is {faction.value}" for name, faction in view.known_factions.items())
             lines.append(f"What you privately know, and only you know: {known}.")

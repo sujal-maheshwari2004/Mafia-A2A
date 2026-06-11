@@ -59,6 +59,9 @@ class Simulation:
         self.bus = CommBus()
         self._knowledge: dict[str, dict[str, Faction]] = {a.name: {} for a in agents}
         self._dead: list[DeathRecord] = []
+        # day_numbers where the doctor's protection foiled the mafia's kill --
+        # the table doesn't learn who was attacked, only that someone was.
+        self._saved_nights: list[int] = []
         # day_number -> {voter: target_or_None}, filled in as votes are cast.
         self._vote_history: dict[int, dict[str, str | None]] = {}
 
@@ -127,6 +130,8 @@ class Simulation:
                 cause="killed in the night",
                 revealed_role=None,
             ))
+        elif result.saved:
+            self._saved_nights.append(result.day_number)
 
         yield NightResolved(day_number=result.day_number, killed=result.killed, saved=result.saved)
 
@@ -264,6 +269,7 @@ class Simulation:
             alive=tuple(p.name for p in self.engine.alive_players),
             present=present,
             dead=tuple(self._dead),
+            saved_nights=tuple(self._saved_nights),
             teammates=teammates,
             known_factions=dict(self._knowledge[name]),
             feed=tuple(self.bus.feed_for(name)),

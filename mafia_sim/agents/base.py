@@ -40,6 +40,7 @@ class AgentView:
     alive: tuple[str, ...]
     present: tuple[str, ...]               # who can actually hear/see you right now (vs. merely alive)
     dead: tuple[DeathRecord, ...]           # gone from the table, in the order they fell
+    saved_nights: tuple[int, ...]           # day_numbers where the doctor foiled the night's kill
     teammates: tuple[str, ...]              # fellow mafia, if you are one
     known_factions: dict[str, Faction]      # learned via investigation, etc.
     feed: tuple[Sighting, ...]              # your personal A2A perception history
