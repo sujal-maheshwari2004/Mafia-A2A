@@ -17,10 +17,10 @@ class CallBudget:
 
     `record()` is called once per agent "turn" (night action / vote /
     discussion turn) that actually proceeds to call the LLM -- each such turn
-    issues 1-3 real API calls (table read, day-summary, main call), so this is
-    a proxy for total call volume, not an exact count. Once `exhausted`,
-    agents fall back to their existing cheap defaults for the rest of the
-    game.
+    issues 1-4 real API calls (table read, day-summary, main call, and an
+    optional critique/rewrite pass on spoken content), so this is a proxy for
+    total call volume, not an exact count. Once `exhausted`, agents fall back
+    to their existing cheap defaults for the rest of the game.
     """
 
     def __init__(self, max_calls: int, max_seconds: float | None = None):

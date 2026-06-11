@@ -36,6 +36,13 @@ PLAYER_NAMES = [
 NUM_MAFIA = 2
 MODEL = "gpt-4.1-mini"
 
+# A few seats get a stronger model than the rest -- small models tend to
+# flatten every persona into the same polite voice, and a handful of
+# stronger voices changes the room's texture without raising cost across
+# all ten seats.
+STRONG_MODEL = "gpt-4.1"
+NUM_STRONG_SEATS = 2
+
 # Safety net against a pathological game racking up cost: once either limit
 # is hit, every agent falls back to cheap defaults for the rest of the game
 # (see CallBudget / LLMAgent).
@@ -73,11 +80,12 @@ def _build_agents(seed: int) -> list[Agent]:
     different group of people from game to game (never repeats a seat -- ten
     players, fifteen personas, no two voices the same on a given night)."""
     personas = random.Random(seed).sample(PERSONAS, len(PLAYER_NAMES))
+    strong_seats = set(random.Random(seed + 1).sample(PLAYER_NAMES, NUM_STRONG_SEATS))
     budget = CallBudget(MAX_LLM_CALLS_PER_GAME, MAX_GAME_SECONDS)
     return [
         LLMAgent(
             name,
-            model=MODEL,
+            model=STRONG_MODEL if name in strong_seats else MODEL,
             persona=persona,
             rng=random.Random(stable_int_seed(name, seed)),
             budget=budget,

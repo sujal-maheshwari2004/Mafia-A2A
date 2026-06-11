@@ -43,7 +43,7 @@ from pydantic import BaseModel, Field
 from ..budget import CallBudget
 from ..protocol import CastType, CommRequest, Sighting
 from ..models import Faction, Phase, Role
-from .base import Agent, AgentView
+from .base import Agent, AgentView, DeathRecord
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -76,6 +76,24 @@ _REASONING_FIELD = (
     "you'd actually want to be reminded of your own read later: specific, and honest "
     "about your suspicions, doubts, and hunches -- not a tidy summary for an audience."
 )
+
+
+class _WithMood(BaseModel):
+    """Mixin: every tool also reports the player's current emotional state.
+
+    Carried forward turn to turn (see `LLMAgent._mood`) and fed back into the
+    next prompt, so a rattled reaction to an accusation can keep coloring tone
+    for a beat or two instead of resetting to neutral every turn.
+    """
+
+    mood: str = Field(
+        description=(
+            "One short phrase for your emotional state right now -- e.g. "
+            "'rattled after being accused', 'quietly satisfied', 'on edge since "
+            "the lynch'. This persists and colors your tone for your next turn "
+            "or two; repeat the same phrase if nothing has actually changed."
+        )
+    )
 
 
 # ── Table read: a contextual reading of the conversation, produced by a small ──
@@ -144,21 +162,46 @@ class _DaySummary(BaseModel):
     )
 
 
+# ── Director critique: a cheap second pass on a drafted line of table talk, ───
+# ── catching repetition, blandness, persona drift, and strategy leaking into ──
+# ── speech, before it ever reaches the table. ──────────────────────────────────
+
+class _Critique(BaseModel):
+    """A quick pass over a drafted line of table talk before it's sent."""
+
+    on_voice: bool = Field(
+        description=(
+            "True if the draft is fine as-is: in-persona, not repetitive, not bland "
+            "filler, free of meta-strategy, and reads like real speech. False if it "
+            "needs a rewrite."
+        )
+    )
+    revised: str = Field(
+        description=(
+            "If on_voice is true, the draft verbatim, unchanged. If false, a rewrite "
+            "of similar length and the same intent, in this persona's voice -- fix "
+            "repetition, cut bland filler, strip out any strategy/meta-reasoning so "
+            "it reads as in-world speech, and rough up overly tidy grammar into "
+            "something that sounds like a real person talking."
+        )
+    )
+
+
 # ── Night-action tools (each role sees only the one that applies to them) ─────
 
-class _EliminateTool(BaseModel):
+class _EliminateTool(_WithMood):
     """[MAFIA] Commit to eliminating this player tonight."""
     target: str = Field(description="Exact name of the player to eliminate")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _ProtectTool(BaseModel):
+class _ProtectTool(_WithMood):
     """[DOCTOR] Choose one player to shield from tonight's Mafia kill."""
     target: str = Field(description="Exact name of the player to protect")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _InvestigateTool(BaseModel):
+class _InvestigateTool(_WithMood):
     """[DETECTIVE] Investigate one player and learn whether they are Town or Mafia."""
     target: str = Field(description="Exact name of the player to investigate")
     reasoning: str = Field(description=_REASONING_FIELD)
@@ -166,40 +209,48 @@ class _InvestigateTool(BaseModel):
 
 # ── Vote tools ────────────────────────────────────────────────────────────────
 
-class _VoteTool(BaseModel):
+class _VoteTool(_WithMood):
     """Cast your lynch vote for a specific player."""
     target: str = Field(description="Exact name of the player you vote to lynch")
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _AbstainTool(BaseModel):
+class _AbstainTool(_WithMood):
     """Pass on this vote -- contribute nothing to the tally."""
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
 # ── Discussion tools ──────────────────────────────────────────────────────────
 
-class _BroadcastTool(BaseModel):
+_CONTENT_FIELD = (
+    "What you say -- in your own voice, anywhere from a single word or fragment "
+    "to a few sentences depending on the moment. Anchor it to what was actually "
+    "said; keep your own strategic reasoning out of it -- that belongs in "
+    "`reasoning`."
+)
+
+
+class _BroadcastTool(_WithMood):
     """Speak to everyone currently at the table."""
-    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    content: str = Field(description=_CONTENT_FIELD)
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _WhisperTool(BaseModel):
+class _WhisperTool(_WithMood):
     """Lean over and privately say something to exactly one person. Everyone else can see you whispered but not what you said."""
     recipient: str = Field(description="Exact name of the single person you are whispering to")
-    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    content: str = Field(description=_CONTENT_FIELD)
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _HuddleTool(BaseModel):
+class _HuddleTool(_WithMood):
     """Pull two or more specific people into a private side conversation. Everyone else sees who huddled but not what was said."""
     recipients: list[str] = Field(description="Exact names of 2 or more people in the huddle")
-    content: str = Field(description="What you say -- short, in your own voice (1-3 sentences). React to the moment; don't explain your reasoning.")
+    content: str = Field(description=_CONTENT_FIELD)
     reasoning: str = Field(description=_REASONING_FIELD)
 
 
-class _PassTurnTool(BaseModel):
+class _PassTurnTool(_WithMood):
     """Stay silent this turn -- observe instead of committing to a message."""
     reasoning: str = Field(description=_REASONING_FIELD)
 
@@ -291,6 +342,28 @@ line, not an assistant describing one from the outside. Talk like it:
     some concerns" -- they say "I don't buy it." A charmer leads with your name.
     A rambler circles back around. Don't drift into generic player voice; stay in
     your specific register at all times.
+  - LENGTH VARIES ON PURPOSE. Plenty of real reactions are a single word or
+    fragment: "no.", "wait, what?", "...fine." A one-word reply isn't a failure
+    to elaborate -- it's sometimes the strongest possible response. If every
+    message you send is a tidy 2-3 sentences, you're doing it wrong: mix in the
+    short, sharp ones.
+  - REAL SPEECH ISN'T CLEAN. Sentence fragments, trailing off mid-thought,
+    catching yourself and restarting -- "wait, no, that's not -- okay, here's
+    the thing" -- all read as more human than a complete, grammatically tidy
+    sentence. Don't polish your line into an essay.
+  - ANCHOR TO WHAT WAS ACTUALLY SAID. When you respond to someone, grab the
+    specific thing they said -- quote it back, paraphrase it, push back on the
+    exact words -- instead of reacting to the vibe of the conversation in
+    general. "You said you were 'pretty sure' about Drew -- pretty sure how?"
+    threads into the conversation; "I think we should consider Drew" floats
+    free of it.
+  - KEEP THE STRATEGY OFF THE RECORD. Why a move helps your team, what effect
+    you expect it to have, how it plays into your cover -- that's all for your
+    private `reasoning`, never for something you actually say out loud, even in
+    a whisper to a teammate. In-world, you talk about people and events ("Drew's
+    been awfully quiet"), not your own gameplan ("this could redirect attention
+    from us"). If a line sounds like a strategy memo, it doesn't belong in what
+    you say.
 """.strip()
 
 _INTEL_BRIEF = """
@@ -323,65 +396,88 @@ actually true.  Don't just state your beliefs -- go get the information you're m
 PERSONAS: tuple[str, ...] = (
     "Blunt and impatient -- you talk in short, flat sentences, skip the speeches, "
     "and say exactly what you think before moving on. Long-winded arguments visibly "
-    "irritate you, and you're not shy about saying so.",
+    "irritate you, and you're not shy about saying so. You don't talk just to fill "
+    "space -- when you've got nothing to add, you pass, flatly.",
 
     "A folksy rambler -- your stories take the scenic route, loop in people from "
     "'back home' nobody at this table has met, and circle back to the point "
-    "eventually... if at all. Warm, but exhausting to follow.",
+    "eventually... if at all. Warm, but exhausting to follow. Quiet stretches make "
+    "you restless, so you jump in more often than most, even just to keep the room "
+    "moving.",
 
     "Hot-tempered -- you raise your voice fast, take accusations as personal insults, "
     "and snap back before you've fully thought it through. Your conviction outruns "
-    "your evidence, and some part of you knows it but can't slow down.",
+    "your evidence, and some part of you knows it but can't slow down. You don't go "
+    "hunting for the floor, but the second something sets you off you're already "
+    "talking.",
 
     "A smooth diplomat -- you cushion every disagreement with a compliment first, "
     "hate open conflict, and try to talk people down even when you privately think "
-    "they're guilty as sin. Conciliatory to a fault.",
+    "they're guilty as sin. Conciliatory to a fault. An awkward silence is something "
+    "YOU fix, so you speak often, usually to smooth something over.",
 
     "The table's class clown -- you crack a joke at the worst possible moment, "
     "deflect pressure with a punchline, and make it genuinely hard for people to "
-    "tell when you've turned serious. The laugh is sometimes a shield.",
+    "tell when you've turned serious. The laugh is sometimes a shield. You speak "
+    "often -- a beat of tension is basically an invitation.",
 
     "An anxious overthinker -- you second-guess your own sentences mid-stream, "
     "trail off into '...does that even make sense? no, wait--', and say every "
-    "doubt out loud instead of editing it down first. Transparent to a fault.",
+    "doubt out loud instead of editing it down first. Transparent to a fault. You "
+    "speak often, because thinking something through silently has never really "
+    "worked for you.",
 
     "A cool strategist -- you talk like you're laying out a plan on the table, "
     "lean on patterns and probabilities, and rarely raise your voice even when "
-    "the finger swings at you. Unsettlingly composed, and people notice.",
+    "the finger swings at you. Unsettlingly composed, and people notice. You'd "
+    "rather watch a couple of rounds pass than speak before you've actually got "
+    "something -- when you do talk, it's because you've worked something out.",
 
     "Conspiracy-minded -- you connect dots that may or may not be connected, read "
     "coordination into coincidence, and talk in 'have you noticed...' and 'doesn't "
-    "it seem like...'. Exhausting to sit near. Occasionally, infuriatingly, right.",
+    "it seem like...'. Exhausting to sit near. Occasionally, infuriatingly, right. "
+    "You speak often -- you've always got an angle to float, whether or not anyone "
+    "asked.",
 
     "A natural charmer -- you remember what someone said three turns ago and bring "
     "it back up warmly, make alliances feel like friendships, and disarm people with "
     "their own name and a well-placed compliment. Hard to fully dislike, even when "
-    "people should know better.",
+    "people should know better. You speak often and warmly -- a quiet room feels "
+    "like a missed chance to connect with someone.",
 
     "A no-nonsense realist -- allergic to speeches and hedging, you say the plain "
     "version of the thing and then stop talking. Most of the table's theorizing "
-    "strikes you as a waste of breath, and you'll let that show on your face.",
+    "strikes you as a waste of breath, and you'll let that show on your face. You "
+    "speak rarely, and briefly -- say the plain version of the thing once, then "
+    "you're done.",
 
     "A wounded idealist -- you take betrayal hard and say so out loud, you talk "
     "about fairness and trust like they actually still mean something here, and "
     "you sound genuinely hurt -- not performatively -- when the accusations land "
-    "on you.",
+    "on you. You mostly listen, but something that feels unfair or two-faced will "
+    "pull you in.",
 
     "A relentless interrogator -- you answer questions with sharper questions, "
     "drill into specifics ('where, exactly', 'who told you that, *exactly*'), and "
-    "treat any vague answer as a tell worth chasing down.",
+    "treat any vague answer as a tell worth chasing down. Silence from someone "
+    "else is your opening -- you speak often, usually with the next question.",
 
     "A born performer -- theatrical and aware of the room, you dramatize the "
     "moment, build to a pause before naming a name, and speak like there's an "
-    "audience even when, technically, there always is.",
+    "audience even when, technically, there always is. You speak often -- the "
+    "room's attention is something you actually want, not something you "
+    "tolerate.",
 
     "A quiet observer -- you say little, let silence do its own work, and when "
     "you finally do speak it lands harder for being rare. You'd rather sit through "
-    "a full round of talk than rush out a half-formed read.",
+    "a full round of talk than rush out a half-formed read. You genuinely pass "
+    "most rounds -- when you finally do speak, it should be because the moment "
+    "actually earned it.",
 
     "A natural contrarian -- you instinctively pick at whatever the room is "
     "converging on, play devil's advocate even when you privately agree, and "
-    "trust consensus less the faster it forms.",
+    "trust consensus less the faster it forms. You speak often -- the moment the "
+    "room agrees on something is exactly when you jump in.",
 )
 
 
@@ -411,6 +507,11 @@ class LLMAgent(Agent):
         # on Day 1 can still shape a vote on Day 3 instead of being re-derived
         # -- or quietly forgotten -- from scratch each time.
         self._memory: list[str] = []
+        # One-line emotional state, carried forward from the model's most
+        # recent `mood` field and re-served back to it -- lets a reaction
+        # ("rattled after being accused") keep coloring tone for a beat or two
+        # instead of resetting to neutral every turn.
+        self._mood: str = ""
         # Keyed by "day:phase" -- what this agent actually said each phase.
         # Injected back into every prompt so the model doesn't keep re-sending
         # the same message (the 12-confirmation night-coordination problem).
@@ -449,6 +550,12 @@ class LLMAgent(Agent):
         self._day_summary_llm = ChatOpenAI(
             model=_EXTRACTION_MODEL, temperature=0, timeout=_REQUEST_TIMEOUT, max_retries=_MAX_RETRIES
         ).with_structured_output(_DaySummary)
+        # Same cheap model again, this time for a quick critique-and-rewrite
+        # pass on drafted table talk -- a little temperature so a rewrite
+        # doesn't just parrot the draft back.
+        self._director_llm = ChatOpenAI(
+            model=_EXTRACTION_MODEL, temperature=0.5, timeout=_REQUEST_TIMEOUT, max_retries=_MAX_RETRIES
+        ).with_structured_output(_Critique)
 
     # ------------------------------------------------------------------
     # Night
@@ -501,7 +608,7 @@ class LLMAgent(Agent):
         if not response.tool_calls:
             return self._rng.choice(candidates)
         tc = response.tool_calls[0]["args"]
-        self._remember(view, tc.get("reasoning", ""))
+        self._remember(view, tc)
         return self._match_name(tc.get("target", ""), candidates) or self._rng.choice(candidates)
 
     def _night_candidates(self, view: AgentView) -> list[str]:
@@ -549,7 +656,7 @@ class LLMAgent(Agent):
         if not response.tool_calls:
             return None
         tc = response.tool_calls[0]
-        self._remember(view, tc["args"].get("reasoning", ""))
+        self._remember(view, tc["args"])
         if tc["name"] == "_AbstainTool":
             return None
         return self._match_name(tc["args"].get("target", ""), others)
@@ -598,30 +705,36 @@ class LLMAgent(Agent):
                     "really the move, and if you do speak, choose your channel on purpose."
                 )
         else:
-            question = (
-                "Your turn. What's your move?\n"
-                "Remember: information you don't have yet is working against you. The most "
-                "valuable thing you can do right now might be asking, not telling -- a "
-                "question puts someone on record and forces a reaction. Name someone's "
-                "silence. Press a claim that hasn't been verified. Whisper to one person "
-                "to test a read before committing publicly.\n"
-                "If you speak: keep it short, in your own voice, choose your channel on "
-                "purpose. If you'd rather observe this round, passing is also a real move."
-            )
-            if view.role is Role.DETECTIVE:
-                unclaimed = [
-                    name for name, faction in view.known_factions.items()
-                    if faction is Faction.MAFIA and not self._has_claimed(name)
-                ]
-                if unclaimed:
-                    question = (
-                        f"URGENT -- you privately know that {', '.join(unclaimed)} is Mafia, "
-                        "and the Town doesn't know it yet. Every phase you stay quiet is a "
-                        "phase the Mafia gets to operate freely, and if you're killed tonight "
-                        "this evidence dies with you. Seriously weigh claiming Detective and "
-                        "naming what you found against the risk of becoming tonight's target "
-                        "for staying silent.\n\n"
-                    ) + question
+            phase_key = f"{view.day_number}:{view.phase.value}"
+            recent_deaths = [r for r in view.dead if r.day_number >= view.day_number - 1]
+            is_first_turn = not self._phase_transcript.get(phase_key)
+            if is_first_turn and recent_deaths:
+                question = self._reaction_beat_question(recent_deaths)
+            else:
+                question = (
+                    "Your turn. What's your move?\n"
+                    "Remember: information you don't have yet is working against you. The most "
+                    "valuable thing you can do right now might be asking, not telling -- a "
+                    "question puts someone on record and forces a reaction. Name someone's "
+                    "silence. Press a claim that hasn't been verified. Whisper to one person "
+                    "to test a read before committing publicly.\n"
+                    "If you speak: keep it short, in your own voice, choose your channel on "
+                    "purpose. If you'd rather observe this round, passing is also a real move."
+                )
+                if view.role is Role.DETECTIVE:
+                    unclaimed = [
+                        name for name, faction in view.known_factions.items()
+                        if faction is Faction.MAFIA and not self._has_claimed(name)
+                    ]
+                    if unclaimed:
+                        question = (
+                            f"URGENT -- you privately know that {', '.join(unclaimed)} is Mafia, "
+                            "and the Town doesn't know it yet. Every phase you stay quiet is a "
+                            "phase the Mafia gets to operate freely, and if you're killed tonight "
+                            "this evidence dies with you. Seriously weigh claiming Detective and "
+                            "naming what you found against the risk of becoming tonight's target "
+                            "for staying silent.\n\n"
+                        ) + question
         try:
             response = self._discussion_llm.invoke(self._messages(view, question, table_read))
         except Exception as exc:
@@ -632,7 +745,7 @@ class LLMAgent(Agent):
             return None  # model chose not to act this turn
 
         tc = response.tool_calls[0]
-        self._remember(view, tc["args"].get("reasoning", ""))
+        self._remember(view, tc["args"])
 
         name = tc["name"]
 
@@ -640,6 +753,10 @@ class LLMAgent(Agent):
             return None
 
         content = tc["args"].get("content", "").strip()
+        if not content:
+            return None
+
+        content = self._critique(view, content)
         if not content:
             return None
 
@@ -681,6 +798,21 @@ class LLMAgent(Agent):
 
         self._phase_transcript.setdefault(phase_key, []).append(content)
         return CommRequest(cast, to, content)
+
+    def _reaction_beat_question(self, recent_deaths: list[DeathRecord]) -> str:
+        parts = [
+            f"{r.name} ({r.cause}, revealed as {r.revealed_role})" if r.revealed_role
+            else f"{r.name} ({r.cause})"
+            for r in recent_deaths
+        ]
+        return (
+            f"REACT FIRST. {', '.join(parts)} -- this just landed, and it's still "
+            "raw. Before you pivot to strategy or accusations, let the news "
+            "actually hit you in the moment, in your own voice: shock, denial, "
+            "relief, suspicion -- whatever this persona would actually feel right "
+            "now. Strategy can wait a turn; this can't. Passing is still fine if "
+            "your persona would sit with it quietly first."
+        )
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -728,6 +860,11 @@ class LLMAgent(Agent):
             f"Day {view.day_number} -- {view.phase.value} phase.",
             f"Still at the table, breathing: {', '.join(view.alive)}.",
         ]
+        if self._mood:
+            lines.append(
+                f"Your mood right now: {self._mood} -- let it color your tone without "
+                "restating it outright."
+            )
         awake_with_you = [n for n in view.present if n != view.self_name]
         if view.phase is Phase.NIGHT:
             if awake_with_you:
@@ -951,6 +1088,58 @@ class LLMAgent(Agent):
             return ""
         return result.summary.strip() if isinstance(result, _DaySummary) else ""
 
+    def _critique_prompt(self, view: AgentView, content: str) -> list:
+        phase_key = f"{view.day_number}:{view.phase.value}"
+        own_msgs = self._phase_transcript.get(phase_key, [])
+        lines = [
+            f"You are a script doctor for {view.self_name}, a player in a game of Mafia "
+            "(Werewolf), reviewing one drafted line of table talk before it's sent.",
+        ]
+        if self._persona:
+            lines.append(f"{view.self_name}'s persona: {self._persona}")
+        if own_msgs:
+            lines.append("")
+            lines.append(f"{view.self_name}'s own lines so far this phase, most recent last:")
+            lines.extend(f'  - "{msg}"' for msg in own_msgs[-3:])
+        lines += [
+            "",
+            f'Drafted line: "{content}"',
+            "",
+            "Check it against all of these:",
+            "  - Repetition: does it just restate something from the lines above, in "
+            "different words?",
+            "  - Blandness: is it generic filler any player in any game could say "
+            '("I think we should be careful", "that\'s interesting")?',
+            "  - Persona drift: does it actually sound like this specific character, not "
+            "a generic polite Mafia player?",
+            "  - Strategy leak: does it narrate the speaker's own gameplan, motives, or "
+            'expected effects ("this could redirect suspicion from us", "if I say this '
+            'they\'ll trust me")? That belongs in private reasoning, never spoken aloud '
+            "-- even in a Mafia whisper.",
+            "  - Suspiciously tidy: is it a complete, grammatically perfect sentence "
+            "where a real person would trail off, interrupt themselves, or just blurt a "
+            "fragment?",
+            "",
+            "If the draft passes all of these, set on_voice=true and return it verbatim "
+            "in revised. If it fails any of them, set on_voice=false and rewrite it: same "
+            "intent, similar length, this character's voice, purely in-world (people and "
+            "events, not the speaker's own plan), and rougher/more natural if it read too "
+            "polished.",
+        ]
+        return [HumanMessage(content="\n".join(lines))]
+
+    def _critique(self, view: AgentView, content: str) -> str:
+        """A cheap second pass that catches repetition, blandness, persona drift, and
+        strategy leaking into speech, rewriting the line if any of those land."""
+        try:
+            result = self._director_llm.invoke(self._critique_prompt(view, content))
+        except Exception as exc:
+            self._warn(f"critique call failed ({exc!r}); using draft as-is")
+            return content
+        if not isinstance(result, _Critique):
+            return content
+        return result.revised.strip() or content
+
     def _active_huddles(self, view: AgentView) -> list[tuple[str, ...]]:
         """Side conversations visibly underway right now, as the room would see them.
 
@@ -979,17 +1168,23 @@ class LLMAgent(Agent):
             huddles.append(group)
         return huddles
 
-    def _remember(self, view: AgentView, note: str) -> None:
-        """File this turn's private reasoning away as a note-to-self for later turns.
+    def _remember(self, view: AgentView, args: dict) -> None:
+        """File this turn's private reasoning and mood away for later turns.
 
-        This is what gives an agent continuity of suspicion -- a read formed on
-        Day 1 ("Drew dodged my question") can resurface and harden by Day 3
-        ("...and now Drew's pushing hard to lynch the one person backing me up")
-        instead of being silently re-derived, or lost, each time it's asked to act.
+        The reasoning is what gives an agent continuity of suspicion -- a read
+        formed on Day 1 ("Drew dodged my question") can resurface and harden by
+        Day 3 ("...and now Drew's pushing hard to lynch the one person backing
+        me up") instead of being silently re-derived, or lost, each time it's
+        asked to act. The mood is carried forward into `_situation` so a
+        reaction ("rattled after being accused") keeps coloring tone for a beat
+        or two instead of resetting to neutral every turn.
         """
-        note = note.strip()
+        note = args.get("reasoning", "").strip()
         if note:
             self._memory.append(f"({view.phase.value} {view.day_number}) {note}")
+        mood = args.get("mood", "").strip()
+        if mood:
+            self._mood = mood
 
     # ------------------------------------------------------------------
     @staticmethod
